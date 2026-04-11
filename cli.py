@@ -1048,7 +1048,7 @@ def _termux_example_image_path(filename: str = "cat.png") -> str:
 
 
 def _split_path_input(raw: str) -> tuple[str, str]:
-    """Split a leading file path token from trailing free-form text.
+    r"""Split a leading file path token from trailing free-form text.
 
     Supports quoted paths and backslash-escaped spaces so callers can accept
     inputs like:
@@ -1719,6 +1719,7 @@ class HermesCLI:
         self._secret_state = None
         self._secret_deadline = 0
         self._spinner_text: str = ""  # thinking spinner text for TUI
+        self._tool_start_time: float = 0.0  # monotonic timestamp when current tool started (for live elapsed)
         self._command_running = False
         self._command_status = ""
         self._attached_images: list[Path] = []
@@ -2130,6 +2131,7 @@ class HermesCLI:
         if not text:
             self._flush_reasoning_preview(force=True)
         self._spinner_text = text or ""
+        self._tool_start_time = 0.0  # clear tool timer when switching to thinking
         self._invalidate()
 
     # ── Streaming display ────────────────────────────────────────────────
@@ -5833,21 +5835,29 @@ class HermesCLI:
         original_count = len(self.conversation_history)
         try:
             from agent.model_metadata import estimate_messages_tokens_rough
-            approx_tokens = estimate_messages_tokens_rough(self.conversation_history)
+            from agent.manual_compression_feedback import summarize_manual_compression
+            original_history = list(self.conversation_history)
+            approx_tokens = estimate_messages_tokens_rough(original_history)
             print(f"🗜️  Compressing {original_count} messages (~{approx_tokens:,} tokens)...")
 
-            compressed, _new_system = self.agent._compress_context(
-                self.conversation_history,
+            compressed, _ = self.agent._compress_context(
+                original_history,
                 self.agent._cached_system_prompt or "",
                 approx_tokens=approx_tokens,
             )
             self.conversation_history = compressed
-            new_count = len(self.conversation_history)
             new_tokens = estimate_messages_tokens_rough(self.conversation_history)
-            print(
-                f"  ✅ Compressed: {original_count} → {new_count} messages "
-                f"(~{approx_tokens:,} → ~{new_tokens:,} tokens)"
+            summary = summarize_manual_compression(
+                original_history,
+                self.conversation_history,
+                approx_tokens,
+                new_tokens,
             )
+            icon = "🗜️" if summary["noop"] else "✅"
+            print(f"  {icon} {summary['headline']}")
+            print(f"     {summary['token_line']}")
+            if summary["note"]:
+                print(f"     {summary['note']}")
 
         except Exception as e:
             print(f"  ❌ Compression failed: {e}")
@@ -6145,11 +6155,20 @@ class HermesCLI:
         Updates the TUI spinner widget so the user can see what the agent
         is doing during tool execution (fills the gap between thinking
         spinner and next response).  Also plays audio cue in voice mode.
+
+        On tool.started, records a monotonic timestamp so get_spinner_text()
+        can show a live elapsed timer (the TUI poll loop already invalidates
+        every ~0.15s, so the counter updates automatically).
         """
-        # Only act on tool.started; ignore tool.completed, reasoning.available, etc.
+        if event_type == "tool.completed":
+            import time as _time
+            self._tool_start_time = 0.0
+            self._invalidate()
+            return
         if event_type != "tool.started":
             return
         if function_name and not function_name.startswith("_"):
+            import time as _time
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(function_name)
             label = preview or function_name
@@ -6158,6 +6177,7 @@ class HermesCLI:
             if _pl > 0 and len(label) > _pl:
                 label = label[:_pl - 3] + "..."
             self._spinner_text = f"{emoji} {label}"
+            self._tool_start_time = _time.monotonic()
             self._invalidate()
 
         if not self._voice_mode:
@@ -7999,7 +8019,7 @@ class HermesCLI:
             agent_name = get_active_skin().get_branding("agent_name", "Hermes Agent")
             msg = f"\n{agent_name} has been suspended. Run `fg` to bring {agent_name} back."
             def _suspend():
-                os.write(1, msg.encode())
+                os.write(1, msg.encode("utf-8", errors="replace"))
                 os.kill(0, _sig.SIGTSTP)
             run_in_terminal(_suspend)
 
@@ -8359,6 +8379,17 @@ class HermesCLI:
             txt = cli_ref._spinner_text
             if not txt:
                 return []
+            # Append live elapsed timer when a tool is running
+            t0 = cli_ref._tool_start_time
+            if t0 > 0:
+                import time as _time
+                elapsed = _time.monotonic() - t0
+                if elapsed >= 60:
+                    _m, _s = int(elapsed // 60), int(elapsed % 60)
+                    elapsed_str = f"{_m}m {_s}s"
+                else:
+                    elapsed_str = f"{elapsed:.1f}s"
+                return [('class:hint', f'  {txt}  ({elapsed_str})')]
             return [('class:hint', f'  {txt}')]
 
         def get_spinner_height():
@@ -8893,6 +8924,7 @@ class HermesCLI:
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""
+                        self._tool_start_time = 0.0
 
                         app.invalidate()  # Refresh status line
 
