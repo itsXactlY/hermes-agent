@@ -153,11 +153,42 @@ NEURAL_GRAPH_SCHEMA = {
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
+NEURAL_DREAM_SCHEMA = {
+    "name": "neural_dream",
+    "description": (
+        "Force an immediate dream cycle — autonomous memory consolidation. "
+        "Runs NREM (replay & strengthen), REM (explore bridges), and "
+        "Insight (community detection) phases. Returns stats from all phases."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "phase": {
+                "type": "string",
+                "description": "Run only a specific phase (nrem, rem, insight) or all.",
+                "enum": ["all", "nrem", "rem", "insight"],
+            },
+        },
+        "required": [],
+    },
+}
+
+NEURAL_DREAM_STATS_SCHEMA = {
+    "name": "neural_dream_stats",
+    "description": (
+        "Get dream engine statistics — past sessions, connections "
+        "strengthened/pruned, bridges found, insights created."
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
 ALL_TOOL_SCHEMAS = [
     NEURAL_REMEMBER_SCHEMA,
     NEURAL_RECALL_SCHEMA,
     NEURAL_THINK_SCHEMA,
     NEURAL_GRAPH_SCHEMA,
+    NEURAL_DREAM_SCHEMA,
+    NEURAL_DREAM_STATS_SCHEMA,
 ]
 
 
@@ -189,9 +220,11 @@ class NeuralMemoryProvider(MemoryProvider):
         self._config: Optional[dict] = None
         self._session_id: str = ""
         self._lock = threading.Lock()
-        self._prefetch_result: str = ""
-        self._prefetch_thread: Optional[threading.Thread] = None
         self._turn_count = 0
+        self._prefetch_result: Optional[str] = None
+        self._prefetch_thread: Optional[threading.Thread] = None
+        self._initial_context: str = ""
+        self._dream_engine = None  # DreamEngine instance
 
     @property
     def name(self) -> str:
@@ -224,10 +257,14 @@ class NeuralMemoryProvider(MemoryProvider):
             # so the agent has historical context immediately, not just after turn 1.
             self._initial_context = self._load_initial_context()
 
+            # Start Dream Engine (background consolidation)
+            self._start_dream_engine()
+
             logger.info(
-                "Neural memory initialized: db=%s, backend=%s",
+                "Neural memory initialized: db=%s, backend=%s, dream=%s",
                 self._config["db_path"],
                 self._config["embedding_backend"],
+                "on" if self._dream_engine else "off",
             )
         except ImportError as e:
             logger.warning("Neural memory dependencies not available: %s", e)
@@ -289,6 +326,45 @@ class NeuralMemoryProvider(MemoryProvider):
             logger.debug("Neural initial context load failed: %s", e)
             return ""
 
+    def _start_dream_engine(self) -> None:
+        """Start the dream engine — autonomous background consolidation."""
+        try:
+            from dream_engine import DreamEngine
+
+            dream_cfg = self._config.get("dream", {})
+            if dream_cfg.get("enabled", True) is False:
+                logger.info("Dream engine disabled by config")
+                return
+
+            idle = dream_cfg.get("idle_threshold", 300)
+            threshold = dream_cfg.get("memory_threshold", 50)
+
+            # Check for MSSQL config
+            mssql_cfg = dream_cfg.get("mssql", None)
+            if mssql_cfg:
+                try:
+                    self._dream_engine = DreamEngine.mssql(
+                        mssql_cfg, self._memory,
+                        idle_threshold=idle, memory_threshold=threshold,
+                    )
+                    logger.info("Dream engine: MSSQL backend")
+                except Exception as e:
+                    logger.warning("MSSQL dream backend failed, falling back to SQLite: %s", e)
+                    mssql_cfg = None
+
+            if not mssql_cfg:
+                self._dream_engine = DreamEngine.sqlite(
+                    self._config["db_path"], self._memory,
+                    idle_threshold=idle, memory_threshold=threshold,
+                )
+                logger.info("Dream engine: SQLite backend")
+
+            self._dream_engine.start()
+
+        except Exception as e:
+            logger.warning("Dream engine failed to start: %s", e)
+            self._dream_engine = None
+
     def system_prompt_block(self) -> str:
         if not self._memory:
             return ""
@@ -300,12 +376,25 @@ class NeuralMemoryProvider(MemoryProvider):
             total = 0
             connections = 0
 
+        # Dream stats
+        dream_info = ""
+        if self._dream_engine:
+            try:
+                ds = self._dream_engine.get_stats()
+                cycles = ds.get("dream_cycles", 0)
+                insights = ds.get("total_insights", 0)
+                if cycles > 0 or insights > 0:
+                    dream_info = f", {cycles} dream cycles, {insights} insights"
+            except Exception:
+                pass
+
         header = (
             f"# Neural Memory\n"
-            f"Active. {total} memories, {connections} connections.\n"
+            f"Active. {total} memories, {connections} connections{dream_info}.\n"
             f"Use neural_remember to store new memories.\n"
             f"Use neural_recall to search semantically.\n"
-            f"Use neural_think to explore connected ideas."
+            f"Use neural_think to explore connected ideas.\n"
+            f"Use neural_dream to force memory consolidation."
         )
 
         if total == 0:
@@ -402,6 +491,9 @@ class NeuralMemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Store the turn as an episodic memory. Skips meta-garbage."""
+        # Reset dream idle timer on activity
+        if self._dream_engine:
+            self._dream_engine.touch()
         if not self._memory:
             return
 
@@ -524,10 +616,20 @@ class NeuralMemoryProvider(MemoryProvider):
             return self._handle_think(args)
         elif tool_name == "neural_graph":
             return self._handle_graph(args)
+        elif tool_name == "neural_dream":
+            return self._handle_dream(args)
+        elif tool_name == "neural_dream_stats":
+            return self._handle_dream_stats(args)
         return tool_error(f"Unknown tool: {tool_name}")
 
     def shutdown(self) -> None:
         """Clean shutdown."""
+        if self._dream_engine:
+            try:
+                self._dream_engine.stop()
+            except Exception:
+                pass
+            self._dream_engine = None
         if self._memory:
             try:
                 self._memory.close()
@@ -549,6 +651,30 @@ class NeuralMemoryProvider(MemoryProvider):
                 "required": False,
                 "default": "auto",
                 "choices": ["auto", "hash", "tfidf", "sentence-transformers"],
+            },
+            {
+                "key": "dream.enabled",
+                "description": "Enable dream engine (background memory consolidation)",
+                "required": False,
+                "default": True,
+            },
+            {
+                "key": "dream.idle_threshold",
+                "description": "Seconds of idle time before dream cycle (default: 300)",
+                "required": False,
+                "default": 300,
+            },
+            {
+                "key": "dream.memory_threshold",
+                "description": "Dream after this many new memories (default: 50)",
+                "required": False,
+                "default": 50,
+            },
+            {
+                "key": "dream.mssql",
+                "description": "MSSQL config dict for dream backend (server, database, username, password)",
+                "required": False,
+                "default": None,
             },
         ]
 
@@ -605,6 +731,39 @@ class NeuralMemoryProvider(MemoryProvider):
             graph = self._memory.graph()
             stats = self._memory.stats()
             return json.dumps({"graph": graph, "stats": stats})
+        except Exception as exc:
+            return tool_error(str(exc))
+
+    def _handle_dream(self, args: dict) -> str:
+        """Force a dream cycle (or specific phase)."""
+        if not self._dream_engine:
+            return tool_error("Dream engine not running")
+        try:
+            phase = args.get("phase", "all")
+            if phase == "all":
+                result = self._dream_engine.dream_now()
+            else:
+                # Run specific phase
+                method_map = {
+                    "nrem": self._dream_engine._phase_nrem,
+                    "rem": self._dream_engine._phase_rem,
+                    "insight": self._dream_engine._phase_insights,
+                }
+                method = method_map.get(phase)
+                if not method:
+                    return tool_error(f"Unknown phase: {phase}")
+                result = method()
+            return json.dumps({"status": "complete", "phase": phase, "stats": result})
+        except Exception as exc:
+            return tool_error(str(exc))
+
+    def _handle_dream_stats(self, args: dict) -> str:
+        """Return dream engine statistics."""
+        if not self._dream_engine:
+            return tool_error("Dream engine not running")
+        try:
+            stats = self._dream_engine.get_stats()
+            return json.dumps(stats)
         except Exception as exc:
             return tool_error(str(exc))
 
