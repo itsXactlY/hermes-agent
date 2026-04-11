@@ -96,7 +96,9 @@ class MSSQLStore:
                  driver=''):
         import pyodbc
 
-        server = server or _env('MSSQL_SERVER', 'localhost')
+        server = server or _env('MSSQL_SERVER', '127.0.0.1')
+        if server == 'localhost':
+            server = '127.0.0.1'  # MSSQL IPv4 only
         database = database or _env('MSSQL_DATABASE', 'NeuralMemory')
         username = username or _env('MSSQL_USERNAME', 'SA')
         password = password or _env('MSSQL_PASSWORD', '')
