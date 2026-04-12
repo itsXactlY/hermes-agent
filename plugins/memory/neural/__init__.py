@@ -55,18 +55,27 @@ _DEFAULT_EMBEDDING = "auto"
 # ---------------------------------------------------------------------------
 
 def _load_config() -> dict:
-    """Load neural memory config from config.yaml, with env var overrides."""
+    """Load neural memory config from config.yaml, with env var overrides.
+
+    Env vars always take precedence over config.yaml values.
+    """
+    # Track which keys were explicitly set via env var
+    _env_keys = set()
     config = {
         "db_path": os.environ.get("NEURAL_MEMORY_DB_PATH", _DEFAULT_DB_PATH),
         "embedding_backend": os.environ.get("NEURAL_EMBEDDING_BACKEND", _DEFAULT_EMBEDDING),
     }
+    if "NEURAL_MEMORY_DB_PATH" in os.environ:
+        _env_keys.add("db_path")
+    if "NEURAL_EMBEDDING_BACKEND" in os.environ:
+        _env_keys.add("embedding_backend")
     try:
         from hermes_cli.config import load_config
         hermes_cfg = load_config()
         neural_cfg = hermes_cfg.get("memory", {}).get("neural", {}) or {}
         if isinstance(neural_cfg, dict):
             for k, v in neural_cfg.items():
-                if v is not None and v != "":
+                if v is not None and v != "" and k not in _env_keys:
                     config[k] = v
     except Exception:
         pass

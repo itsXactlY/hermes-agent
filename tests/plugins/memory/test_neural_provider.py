@@ -95,11 +95,11 @@ class TestSchemas:
     def test_graph_schema_no_required(self):
         assert NEURAL_GRAPH_SCHEMA["parameters"]["required"] == []
 
-    def test_get_tool_schemas_returns_four(self, provider):
+    def test_get_tool_schemas_returns_six(self, provider):
         schemas = provider.get_tool_schemas()
-        assert len(schemas) == 4
+        assert len(schemas) == 6
         names = {s["name"] for s in schemas}
-        assert names == {"neural_remember", "neural_recall", "neural_think", "neural_graph"}
+        assert names == {"neural_remember", "neural_recall", "neural_think", "neural_graph", "neural_dream", "neural_dream_stats"}
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +347,7 @@ class TestLifecycle:
             {"role": "assistant", "content": "Paris is the capital of France."},
         ]
         result = provider.on_pre_compress(messages)
-        assert "Key context preserved" in result
+        assert "Context preserved" in result
         assert "Deploy" in result
 
         # Verify memories were stored
