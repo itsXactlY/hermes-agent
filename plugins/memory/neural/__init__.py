@@ -579,9 +579,18 @@ class NeuralMemoryProvider(MemoryProvider):
         )
         is_boilerplate = any(b in assist_lower for b in _boilerplate) and len(assist_clean) < 200
 
-        if is_boilerplate or not assist_clean:
-            # Store user content only — more focused embedding
-            return f"Topic: {user_clean[:300]}"
+        # Detect non-answers (agent couldn't find info)
+        _non_answers = (
+            "i don't have", "i don't know", "i can't find",
+            "no specific memory", "memory is incomplete",
+            "i don't recall", "beyond what's in my notes",
+            "can you remind me", "nothing specific about",
+        )
+        is_non_answer = any(n in assist_lower for n in _non_answers)
+
+        if is_boilerplate or not assist_clean or is_non_answer:
+            # Store user question only — the TOPIC is still valuable
+            return f"Question: {user_clean[:300]}"
 
         # Substantive exchange — store both but structured
         return f"Topic: {user_clean[:200]}\nResult: {assist_clean[:300]}"
