@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import sys
 import threading
 from pathlib import Path
@@ -257,6 +258,110 @@ class NeuralMemoryProvider(MemoryProvider):
         self._prefetch_thread: Optional[threading.Thread] = None
         self._initial_context: str = ""
         self._dream_engine = None  # DreamEngine instance
+        # Sponge mode: immediate background absorption
+        self._sponge_queue: Optional[queue.Queue] = None
+        self._sponge_worker: Optional[threading.Thread] = None
+        self._sponge_running = False
+
+    def _start_sponge(self) -> None:
+        """Start the sponge worker thread for immediate message absorption."""
+        if self._sponge_running:
+            return
+        self._sponge_queue = queue.Queue(maxsize=100)
+        self._sponge_running = True
+        self._sponge_worker = threading.Thread(
+            target=self._sponge_loop, daemon=True, name="neural-sponge"
+        )
+        self._sponge_worker.start()
+        logger.debug("Neural sponge worker started")
+
+    def _stop_sponge(self) -> None:
+        """Stop the sponge worker thread."""
+        self._sponge_running = False
+        if self._sponge_queue:
+            try:
+                self._sponge_queue.put_nowait(None)  # sentinel
+            except queue.Full:
+                pass
+        if self._sponge_worker and self._sponge_worker.is_alive():
+            self._sponge_worker.join(timeout=3)
+        self._sponge_worker = None
+        self._sponge_queue = None
+
+    def _sponge_loop(self) -> None:
+        """Background worker: drain queue and store memories."""
+        while self._sponge_running:
+            try:
+                item = self._sponge_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            if item is None:  # sentinel
+                break
+            role, content = item
+            try:
+                self._do_absorb(role, content)
+            except Exception as e:
+                logger.debug("Sponge absorb failed: %s", e)
+
+    def _do_absorb(self, role: str, content: str) -> None:
+        """Actually store a message as a memory (called from sponge worker)."""
+        if not self._memory:
+            return
+        if self._is_garbage(content):
+            return
+
+        # Extract meaningful content based on role
+        if role == "user":
+            label = f"user-msg"
+            memory_text = f"Q: {content[:500]}"
+        else:
+            # For assistant: check if it's a non-answer
+            assist_lower = content.lower()[:300]
+            _non_answers = (
+                "i don't have", "i don't know", "i can't find",
+                "no specific memory", "memory is incomplete",
+                "i don't recall", "beyond what's in my notes",
+                "can you remind me", "nothing specific about",
+            )
+            if any(n in assist_lower for n in _non_answers):
+                return  # Don't store non-answers
+            label = f"asst-msg"
+            memory_text = f"A: {content[:500]}"
+
+        # Deduplicate: skip if very similar content already exists
+        try:
+            existing = self._memory.recall(memory_text[:100], k=1)
+            if existing and existing[0].get("similarity", 0) > 0.95:
+                # Extra check: verify actual content overlap, not just embedding similarity
+                existing_content = (existing[0].get("content", "") or "")[:100]
+                if existing_content and existing_content == memory_text[:len(existing_content)]:
+                    return  # Exact duplicate
+        except Exception:
+            pass
+
+        try:
+            self._memory.remember(memory_text, label=label)
+        except Exception as e:
+            logger.debug("Sponge remember failed: %s", e)
+
+    def absorb_message(self, role: str, content: str) -> None:
+        """Queue a message for immediate background absorption.
+
+        Call this for EVERY message as it arrives — user messages before
+        processing, assistant messages after generation. Non-blocking.
+
+        Args:
+            role: 'user' or 'assistant'
+            content: The message text
+        """
+        if not self._sponge_running or not self._memory:
+            return
+        if not content or len(content.strip()) < 10:
+            return
+        try:
+            self._sponge_queue.put_nowait((role, content))
+        except queue.Full:
+            logger.debug("Sponge queue full, dropping message")
 
     @property
     def name(self) -> str:
@@ -288,6 +393,9 @@ class NeuralMemoryProvider(MemoryProvider):
 
             # Start Dream Engine (background consolidation)
             self._start_dream_engine()
+
+            # Start Sponge worker (immediate message absorption)
+            self._start_sponge()
 
             # Eager prefetch: load recent/important context for the first turn
             # so the agent has historical context immediately, not just after turn 1.
@@ -815,6 +923,7 @@ class NeuralMemoryProvider(MemoryProvider):
 
     def shutdown(self) -> None:
         """Clean shutdown."""
+        self._stop_sponge()
         if self._dream_engine:
             try:
                 self._dream_engine.stop()

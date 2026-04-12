@@ -7505,6 +7505,10 @@ class AIAgent:
         messages.append(user_msg)
         current_turn_user_idx = len(messages) - 1
         self._persist_user_message_idx = current_turn_user_idx
+
+        # Sponge: immediately absorb user message (non-blocking, background)
+        if self._memory_manager and original_user_message:
+            self._memory_manager.absorb_message("user", original_user_message)
         
         if not self.quiet_mode:
             self._safe_print(f"💬 Starting conversation: '{user_message[:60]}{'...' if len(user_message) > 60 else ''}'")
@@ -9976,6 +9980,8 @@ class AIAgent:
         # injected skill content that bloats / breaks provider queries.
         if self._memory_manager and final_response and original_user_message:
             try:
+                # Sponge: immediately absorb assistant response (non-blocking)
+                self._memory_manager.absorb_message("assistant", final_response)
                 self._memory_manager.sync_all(original_user_message, final_response)
                 self._memory_manager.queue_prefetch_all(original_user_message)
             except Exception:
