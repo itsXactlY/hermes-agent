@@ -238,6 +238,14 @@ class NeuralMemoryProvider(MemoryProvider):
     _NOISE_LABELS = frozenset({
         "pre-compress",
     })
+    # Label prefixes that are auto-generated noise (cron reports, gateway msgs)
+    _NOISE_LABEL_PREFIXES = ("msg:",)
+
+    def _is_noise_label(self, label: str) -> bool:
+        """Check if a label indicates auto-generated noise."""
+        if label in self._NOISE_LABELS:
+            return True
+        return any(label.startswith(p) for p in self._NOISE_LABEL_PREFIXES)
 
     def __init__(self) -> None:
         self._memory = None  # NeuralMemory instance
@@ -338,7 +346,7 @@ class NeuralMemoryProvider(MemoryProvider):
                         continue
                     label = mem.get("label", "")
                     # Skip noise labels (auto-saved turns, pre-compress dumps)
-                    if label in self._NOISE_LABELS:
+                    if self._is_noise_label(label):
                         continue
                     if label.startswith("memory-"):
                         continue
@@ -519,7 +527,7 @@ class NeuralMemoryProvider(MemoryProvider):
                     if sim < 0.25:  # skip irrelevant results
                         continue
                     label = r.get("label", "")
-                    if label in self._NOISE_LABELS:  # skip noise
+                    if self._is_noise_label(label):  # skip noise
                         continue
                     content = r.get("content", "")
                     if self._is_garbage(content):
@@ -889,7 +897,7 @@ class NeuralMemoryProvider(MemoryProvider):
             for r in results:
                 label = r.get("label", "")
                 # Skip noise memories
-                if label in self._NOISE_LABELS:
+                if self._is_noise_label(label):
                     continue
                 sim = r.get("similarity", 0)
                 if sim < 0.1:
