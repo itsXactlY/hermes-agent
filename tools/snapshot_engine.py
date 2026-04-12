@@ -1,0 +1,725 @@
+"""
+Runtime Snapshot Engine — Self-versioning state snapshots for Hermes.
+
+Content-addressed storage (like git-lite) for the internal state of ~/.hermes.
+Snapshots are deduplicated, debounced, and fully independent of git.
+
+Key concepts:
+  - objects/: SHA256-addressed blob store (deduplication)
+  - snapshots/: Per-snapshot manifest.json + meta.json
+  - history.db: SQLite index for fast queries
+  - Debounced auto-snapshots (30s default, 15s for memory writes)
+
+Usage:
+  from tools.snapshot_engine import SnapshotEngine, auto_snapshot, safe_run
+
+  engine = SnapshotEngine()
+  snap_id = engine.snapshot(label="pre-upgrade")
+
+  # Restore
+  engine.restore(snap_id)
+
+  # Auto (debounced)
+  auto_snapshot(trigger="memory_write")
+
+  # Transaction
+  result = safe_run(my_function, label="dangerous-op")
+"""
+
+import hashlib
+import json
+import logging
+import os
+import shutil
+import sqlite3
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from hermes_constants import get_hermes_home
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Directories/files to include in snapshots (relative to hermes_home)
+INCLUDE_FILES: Set[str] = {
+    "state.db",
+    "config.yaml",
+    "auth.json",
+    "cron/jobs.json",
+    "gateway_state.json",
+    "channel_directory.json",
+    "processes.json",
+}
+
+# Patterns to exclude from ALL walks
+EXCLUDE_PATTERNS: Set[str] = {
+    ".snapshots",
+    "hermes-agent",
+    "venv",
+    ".venv",
+    "checkpoints",
+    "sessions",
+    "logs",
+    "cache",
+    "skills",
+    "optional-skills",
+    "node_modules",
+    "__pycache__",
+    ".git",
+    "broken",
+    "pastes",
+    "temp_vision_images",
+    "tests",
+    "website",
+    "bin",
+    "acp_adapter",
+    "acp_registry",
+    "agent",
+    "assets",
+    "datagen-config-examples",
+    "docker",
+    "docs",
+    "environments",
+    "gateway",
+    "hermelinChat",
+    "hermes_cli",
+    "honcho_integration",
+    "landingpage",
+    "nix",
+    "packaging",
+    "plans",
+    ".plans",
+    "plugins",
+    "scripts",
+    "tinker-atropos",
+    "tools",
+}
+
+# SQLite WAL/SHM files — never snapshot these directly
+SQLITE_WAL_PATTERNS = {".db-wal", ".db-shm"}
+
+# Debounce windows (seconds)
+_DEBOUNCE_DEFAULT = 30
+_DEBOUNCE_MEMORY = 15
+
+# ---------------------------------------------------------------------------
+# Module-level state for debouncing
+# ---------------------------------------------------------------------------
+_last_snapshot_time: float = 0
+_last_state_hash: str = ""
+_debounce_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Core Engine
+# ---------------------------------------------------------------------------
+
+def _update_state_hash(h: str) -> None:
+    """Update the module-level state hash (must be called from within SnapshotEngine)."""
+    global _last_state_hash
+    _last_state_hash = h
+
+
+class SnapshotEngine:
+    """Content-addressed snapshot engine for Hermes runtime state."""
+
+    def __init__(self, hermes_home: Optional[Path] = None):
+        self.hermes_home = hermes_home or get_hermes_home()
+        self.store = self.hermes_home / ".snapshots"
+        self.objects = self.store / "objects"
+        self.snapshots_dir = self.store / "snapshots"
+        self.head_file = self.store / "HEAD"
+        self.history_db = self.store / "history.db"
+
+        # Ensure directories exist
+        self.objects.mkdir(parents=True, exist_ok=True)
+        self.snapshots_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize history DB
+        self._init_history_db()
+
+    def _init_history_db(self) -> None:
+        """Create the snapshot index database."""
+        conn = sqlite3.connect(str(self.history_db))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                label TEXT,
+                trigger TEXT,
+                file_count INTEGER,
+                total_size INTEGER,
+                unique_objects INTEGER,
+                created_at REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS snapshot_files (
+                snapshot_id TEXT NOT NULL,
+                rel_path TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                PRIMARY KEY (snapshot_id, rel_path),
+                FOREIGN KEY (snapshot_id) REFERENCES snapshots(id)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_snapshots_time
+            ON snapshots(timestamp)
+        """)
+        conn.commit()
+        conn.close()
+
+    # -- File hashing --------------------------------------------------------
+
+    @staticmethod
+    def _hash_bytes(data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    def _hash_file(self, path: Path) -> str:
+        """Hash a file's contents (SHA-256)."""
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while chunk := f.read(65536):
+                h.update(chunk)
+        return h.hexdigest()
+
+    # -- Object store --------------------------------------------------------
+
+    def _store_object(self, data: bytes) -> str:
+        """Store bytes in the content-addressed object store. Returns SHA-256."""
+        sha = self._hash_bytes(data)
+        obj_path = self.objects / sha[:2] / sha[2:]
+
+        if not obj_path.exists():
+            obj_path.parent.mkdir(parents=True, exist_ok=True)
+            obj_path.write_bytes(data)
+
+        return sha
+
+    def _store_file_object(self, path: Path) -> str:
+        """Store a file's contents as an object. Returns SHA-256."""
+        data = path.read_bytes()
+        return self._store_object(data)
+
+    def _get_object(self, sha: str) -> Optional[bytes]:
+        """Retrieve object bytes by SHA-256 hash."""
+        obj_path = self.objects / sha[:2] / sha[2:]
+        if obj_path.exists():
+            return obj_path.read_bytes()
+        return None
+
+    # -- SQLite safe copy ----------------------------------------------------
+
+    def _safe_copy_db(self, src: Path, dst: Path) -> bool:
+        """Copy a SQLite database safely using the backup API.
+
+        Handles WAL mode — produces a consistent snapshot even while
+        the DB is being written to by the agent.
+        """
+        try:
+            conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+            backup_conn = sqlite3.connect(str(dst))
+            conn.backup(backup_conn)
+            backup_conn.close()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.warning("SQLite safe copy failed for %s: %s", src, e)
+            # Fallback: raw copy (may have WAL inconsistencies, but better than nothing)
+            try:
+                shutil.copy2(src, dst)
+                return True
+            except Exception as e2:
+                logger.error("Raw copy also failed for %s: %s", src, e2)
+                return False
+
+    # -- Snapshot creation ---------------------------------------------------
+
+    def _collect_state_files(self) -> List[Tuple[str, Path]]:
+        """Collect all files to snapshot. Returns [(rel_path, abs_path)]."""
+        files = []
+        for rel_name in sorted(INCLUDE_FILES):
+            abs_path = self.hermes_home / rel_name
+            if abs_path.exists() and abs_path.is_file():
+                # Skip WAL files
+                if any(str(abs_path).endswith(p) for p in SQLITE_WAL_PATTERNS):
+                    continue
+                files.append((rel_name, abs_path))
+        return files
+
+    def compute_state_hash(self) -> str:
+        """Compute a hash of the current state for change detection.
+
+        Uses modification times + file sizes (fast, no I/O on large files).
+        """
+        parts = []
+        for rel_path, abs_path in self._collect_state_files():
+            try:
+                stat = abs_path.stat()
+                parts.append(f"{rel_path}:{stat.st_mtime_ns}:{stat.st_size}")
+            except OSError:
+                parts.append(f"{rel_path}:missing")
+        return self._hash_bytes("|".join(parts).encode())
+
+    def snapshot(
+        self,
+        label: Optional[str] = None,
+        trigger: str = "manual",
+    ) -> Optional[str]:
+        """Create a new snapshot of the current state.
+
+        Args:
+            label: Optional human-readable label
+            trigger: What triggered this snapshot (manual, memory_write, tool_result, agent_step, pre-run)
+
+        Returns:
+            Snapshot ID (timestamp-based), or None if nothing changed.
+        """
+        state_hash = self.compute_state_hash()
+
+        # Skip if state hasn't changed since last snapshot
+        head = self.get_head()
+        if head:
+            try:
+                conn = sqlite3.connect(str(self.history_db))
+                row = conn.execute(
+                    "SELECT 1 FROM snapshot_files WHERE snapshot_id = ? LIMIT 1",
+                    (head,),
+                ).fetchone()
+                conn.close()
+                # If head exists and state hash matches, skip
+                if row and state_hash == _last_state_hash:
+                    logger.debug("State unchanged, skipping snapshot")
+                    return None
+            except Exception:
+                pass
+
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        snap_id = f"{ts}-{label}" if label else ts
+
+        snap_dir = self.snapshots_dir / snap_id
+        snap_dir.mkdir(parents=True, exist_ok=True)
+
+        manifest: Dict[str, str] = {}
+        file_sizes: Dict[str, int] = {}
+        total_size = 0
+        unique_hashes: Set[str] = set()
+
+        # Collect and store files
+        for rel_path, abs_path in self._collect_state_files():
+            try:
+                # Special handling for SQLite databases
+                if abs_path.suffix == ".db" and abs_path.name == "state.db":
+                    tmp_path = snap_dir / "_tmp_db"
+                    if self._safe_copy_db(abs_path, tmp_path):
+                        sha = self._store_file_object(tmp_path)
+                        size = tmp_path.stat().st_size
+                        tmp_path.unlink(missing_ok=True)
+                    else:
+                        continue
+                else:
+                    sha = self._store_file_object(abs_path)
+                    size = abs_path.stat().st_size
+
+                manifest[rel_path] = sha
+                file_sizes[rel_path] = size
+                total_size += size
+                unique_hashes.add(sha)
+
+            except (OSError, PermissionError) as e:
+                logger.warning("Could not snapshot %s: %s", rel_path, e)
+                continue
+
+        if not manifest:
+            logger.warning("No files to snapshot")
+            shutil.rmtree(snap_dir, ignore_errors=True)
+            return None
+
+        # Write manifest
+        with open(snap_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2)
+
+        # Write metadata
+        meta = {
+            "id": snap_id,
+            "timestamp": ts,
+            "label": label,
+            "trigger": trigger,
+            "file_count": len(manifest),
+            "total_size": total_size,
+            "unique_objects": len(unique_hashes),
+            "state_hash": state_hash,
+        }
+        with open(snap_dir / "meta.json", "w") as f:
+            json.dump(meta, f, indent=2)
+
+        # Update HEAD
+        self.head_file.write_text(snap_id)
+
+        # Update history DB
+        try:
+            conn = sqlite3.connect(str(self.history_db))
+            conn.execute(
+                "INSERT OR REPLACE INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (snap_id, ts, label, trigger, len(manifest), total_size,
+                 len(unique_hashes), time.time()),
+            )
+            for rel_path, sha in manifest.items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO snapshot_files VALUES (?, ?, ?, ?)",
+                    (snap_id, rel_path, sha, file_sizes.get(rel_path, 0)),
+                )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning("Failed to update history DB: %s", e)
+
+        # Update module-level debounce state
+        _update_state_hash(state_hash)
+
+        logger.info(
+            "Snapshot %s: %d files, %d unique objects, %s trigger",
+            snap_id, len(manifest), len(unique_hashes), trigger,
+        )
+        return snap_id
+
+    # -- Restore -------------------------------------------------------------
+
+    def restore(self, snapshot_id: str) -> bool:
+        """Restore state from a snapshot.
+
+        Args:
+            snapshot_id: The snapshot ID to restore from.
+
+        Returns:
+            True if restore succeeded.
+        """
+        snap_dir = self.snapshots_dir / snapshot_id
+        if not snap_dir.exists():
+            logger.error("Snapshot not found: %s", snapshot_id)
+            return False
+
+        manifest_path = snap_dir / "manifest.json"
+        if not manifest_path.exists():
+            logger.error("No manifest in snapshot: %s", snapshot_id)
+            return False
+
+        with open(manifest_path) as f:
+            manifest: Dict[str, str] = json.load(f)
+
+        restored = 0
+        for rel_path, sha in manifest.items():
+            obj_path = self.objects / sha[:2] / sha[2:]
+            if not obj_path.exists():
+                logger.error("Object not found: %s (for %s)", sha, rel_path)
+                continue
+
+            target = self.hermes_home / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+            try:
+                # For state.db, use the safe copy approach (write object to tmp, then restore)
+                if target.name == "state.db":
+                    tmp_path = target.parent / f".{target.name}.snap_restore"
+                    shutil.copy2(obj_path, tmp_path)
+                    # Replace the live DB
+                    target.unlink(missing_ok=True)
+                    shutil.move(str(tmp_path), str(target))
+                else:
+                    shutil.copy2(obj_path, target)
+                restored += 1
+            except Exception as e:
+                logger.error("Failed to restore %s: %s", rel_path, e)
+
+        # Update HEAD
+        self.head_file.write_text(snapshot_id)
+
+        logger.info("Restored %d/%d files from snapshot %s", restored, len(manifest), snapshot_id)
+        return restored > 0
+
+    # -- List ----------------------------------------------------------------
+
+    def get_head(self) -> Optional[str]:
+        """Get the current HEAD snapshot ID."""
+        try:
+            return self.head_file.read_text().strip()
+        except (FileNotFoundError, OSError):
+            return None
+
+    def list_snapshots(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """List recent snapshots with metadata.
+
+        Returns most recent first.
+        """
+        try:
+            conn = sqlite3.connect(str(self.history_db))
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM snapshots ORDER BY timestamp DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
+        except Exception:
+            # Fallback: scan filesystem
+            result = []
+            if self.snapshots_dir.exists():
+                for d in sorted(self.snapshots_dir.iterdir(), reverse=True):
+                    if d.is_dir():
+                        meta_path = d / "meta.json"
+                        if meta_path.exists():
+                            try:
+                                with open(meta_path) as f:
+                                    result.append(json.load(f))
+                            except Exception:
+                                pass
+            return result[:limit]
+
+    # -- Diff ----------------------------------------------------------------
+
+    def diff(self, snap_id_a: str, snap_id_b: str) -> Dict[str, Any]:
+        """Compare two snapshots. Returns changed/added/removed files."""
+        def _load_manifest(sid: str) -> Dict[str, str]:
+            path = self.snapshots_dir / sid / "manifest.json"
+            if path.exists():
+                with open(path) as f:
+                    return json.load(f)
+            return {}
+
+        ma = _load_manifest(snap_id_a)
+        mb = _load_manifest(snap_id_b)
+
+        all_paths = set(ma.keys()) | set(mb.keys())
+        changed = []
+        added = []
+        removed = []
+
+        for p in sorted(all_paths):
+            ha = ma.get(p)
+            hb = mb.get(p)
+            if ha and hb and ha != hb:
+                changed.append(p)
+            elif not ha and hb:
+                added.append(p)
+            elif ha and not hb:
+                removed.append(p)
+
+        return {
+            "snapshot_a": snap_id_a,
+            "snapshot_b": snap_id_b,
+            "changed": changed,
+            "added": added,
+            "removed": removed,
+        }
+
+    # -- Prune ---------------------------------------------------------------
+
+    def prune(
+        self,
+        keep_last: int = 100,
+        keep_hourly: int = 24,
+        keep_daily: int = 30,
+    ) -> int:
+        """Prune old snapshots. Returns count of deleted snapshots.
+
+        Strategy:
+          - Always keep the last `keep_last` snapshots
+          - Keep one per hour for the last `keep_hourly` hours
+          - Keep one per day for the last `keep_daily` days
+          - Delete the rest
+        """
+        snaps = self.list_snapshots(limit=10000)
+        if len(snaps) <= keep_last:
+            return 0
+
+        keep: Set[str] = set()
+
+        # Always keep last N
+        for s in snaps[:keep_last]:
+            keep.add(s["id"])
+
+        # Keep hourly (one per hour)
+        seen_hours: Set[str] = set()
+        for s in snaps:
+            ts = s.get("timestamp", "")
+            hour_key = ts[:10] + ts[10:13]  # YYYYMMDD-HH
+            if hour_key not in seen_hours and len(seen_hours) < keep_hourly:
+                keep.add(s["id"])
+                seen_hours.add(hour_key)
+
+        # Keep daily (one per day)
+        seen_days: Set[str] = set()
+        for s in snaps:
+            ts = s.get("timestamp", "")
+            day_key = ts[:8]  # YYYYMMDD
+            if day_key not in seen_days and len(seen_days) < keep_daily:
+                keep.add(s["id"])
+                seen_days.add(day_key)
+
+        # Delete everything not in keep set
+        deleted = 0
+        for s in snaps:
+            if s["id"] not in keep:
+                snap_dir = self.snapshots_dir / s["id"]
+                if snap_dir.exists():
+                    shutil.rmtree(snap_dir, ignore_errors=True)
+                    deleted += 1
+
+        # Clean up history DB
+        if deleted:
+            try:
+                conn = sqlite3.connect(str(self.history_db))
+                for s in snaps:
+                    if s["id"] not in keep:
+                        conn.execute("DELETE FROM snapshot_files WHERE snapshot_id = ?", (s["id"],))
+                        conn.execute("DELETE FROM snapshots WHERE id = ?", (s["id"],))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                logger.warning("Failed to clean history DB during prune: %s", e)
+
+        # Clean orphaned objects (optional — run occasionally)
+        self._clean_orphaned_objects()
+
+        logger.info("Pruned %d snapshots (kept %d)", deleted, len(keep))
+        return deleted
+
+    def _clean_orphaned_objects(self) -> int:
+        """Remove objects not referenced by any snapshot. Returns count removed."""
+        # Collect all referenced hashes
+        referenced: Set[str] = set()
+        try:
+            conn = sqlite3.connect(str(self.history_db))
+            rows = conn.execute("SELECT DISTINCT sha256 FROM snapshot_files").fetchall()
+            conn.close()
+            referenced = {r[0] for r in rows}
+        except Exception:
+            return 0
+
+        removed = 0
+        if self.objects.exists():
+            for prefix_dir in self.objects.iterdir():
+                if not prefix_dir.is_dir():
+                    continue
+                for obj_file in prefix_dir.iterdir():
+                    full_hash = prefix_dir.name + obj_file.name
+                    if full_hash not in referenced:
+                        obj_file.unlink(missing_ok=True)
+                        removed += 1
+                        # Clean empty prefix dirs
+                        try:
+                            prefix_dir.rmdir()
+                        except OSError:
+                            pass
+
+        return removed
+
+
+# ---------------------------------------------------------------------------
+# Convenience functions (module-level, no engine instance needed)
+# ---------------------------------------------------------------------------
+
+_engine: Optional[SnapshotEngine] = None
+_engine_lock = threading.Lock()
+
+
+def _get_engine() -> SnapshotEngine:
+    """Get or create the global snapshot engine instance."""
+    global _engine
+    if _engine is None:
+        with _engine_lock:
+            if _engine is None:
+                _engine = SnapshotEngine()
+    return _engine
+
+
+def auto_snapshot(
+    debounce_seconds: Optional[float] = None,
+    label: Optional[str] = None,
+    trigger: str = "auto",
+) -> Optional[str]:
+    """Create a debounced auto-snapshot if state has changed.
+
+    Uses module-level state for debouncing across calls.
+    Returns snapshot ID or None if skipped.
+    """
+    global _last_snapshot_time
+
+    # Select debounce window based on trigger
+    if debounce_seconds is None:
+        debounce_seconds = (
+            _DEBOUNCE_MEMORY if trigger == "memory_write" else _DEBOUNCE_DEFAULT
+        )
+
+    now = time.time()
+
+    with _debounce_lock:
+        if now - _last_snapshot_time < debounce_seconds:
+            return None
+        _last_snapshot_time = now
+
+    try:
+        engine = _get_engine()
+        return engine.snapshot(label=label, trigger=trigger)
+    except Exception as e:
+        logger.warning("Auto-snapshot failed: %s", e)
+        return None
+
+
+def safe_run(fn, label: str = "safe-run") -> Any:
+    """Execute fn() with automatic snapshot + rollback on failure.
+
+    Creates a pre-execution snapshot. If fn() raises, restores to that snapshot.
+
+    Usage:
+        result = safe_run(lambda: risky_operation(), label="upgrade-config")
+    """
+    engine = _get_engine()
+    snap_id = engine.snapshot(label=f"pre-{label}", trigger="pre-run")
+
+    try:
+        result = fn()
+        return result
+    except Exception as e:
+        if snap_id:
+            logger.warning("Rolling back to snapshot %s after error: %s", snap_id, e)
+            engine.restore(snap_id)
+        raise
+
+
+def snapshot(label: Optional[str] = None, trigger: str = "manual") -> Optional[str]:
+    """Create a snapshot. Shorthand for engine.snapshot()."""
+    return _get_engine().snapshot(label=label, trigger=trigger)
+
+
+def restore(snapshot_id: str) -> bool:
+    """Restore from a snapshot. Shorthand for engine.restore()."""
+    return _get_engine().restore(snapshot_id)
+
+
+def list_snapshots(limit: int = 50) -> List[Dict[str, Any]]:
+    """List snapshots. Shorthand for engine.list_snapshots()."""
+    return _get_engine().list_snapshots(limit=limit)
+
+
+def get_head() -> Optional[str]:
+    """Get HEAD snapshot ID. Shorthand for engine.get_head()."""
+    return _get_engine().get_head()
+
+
+def diff(snap_id_a: str, snap_id_b: str) -> Dict[str, Any]:
+    """Diff two snapshots. Shorthand for engine.diff()."""
+    return _get_engine().diff(snap_id_a, snap_id_b)
+
+
+def prune(keep_last: int = 100, keep_hourly: int = 24, keep_daily: int = 30) -> int:
+    """Prune old snapshots. Shorthand for engine.prune()."""
+    return _get_engine().prune(keep_last=keep_last, keep_hourly=keep_hourly, keep_daily=keep_daily)
