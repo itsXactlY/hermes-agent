@@ -3338,6 +3338,92 @@ class HermesCLI:
             # Treat as a git hash
             return ref
 
+    def _handle_snapshot_command(self, command: str):
+        """Handle /snapshot — runtime state snapshots.
+
+        Syntax:
+            /snapshot                  — list recent snapshots
+            /snapshot create [label]   — create a snapshot
+            /snapshot rewind <id>      — restore state from snapshot
+            /snapshot diff <a> <b>     — compare two snapshots
+            /snapshot prune            — clean up old snapshots
+            /snapshot head             — show current HEAD snapshot
+        """
+        from tools.snapshot_engine import SnapshotEngine
+
+        engine = SnapshotEngine()
+        parts = command.split()
+        subcmd = parts[1].lower() if len(parts) > 1 else "list"
+
+        if subcmd in ("list", "ls"):
+            snaps = engine.list_snapshots(limit=20)
+            if not snaps:
+                print("  No snapshots yet.")
+                print("  Create one: /snapshot create [label]")
+                return
+            head = engine.get_head()
+            print(f"  {'':3}  {'ID':<35} {'Files':>5} {'Size':>8} {'Trigger':<12} {'Label'}")
+            print(f"  {'':3}  {'─'*35} {'─'*5} {'─'*8} {'─'*12} {'─'*20}")
+            for i, s in enumerate(snaps):
+                marker = " ◀" if s["id"] == head else ""
+                size = s.get("total_size", 0)
+                size_str = f"{size/1024:.0f}KB" if size < 1024*1024 else f"{size/1024/1024:.1f}MB"
+                label = s.get("label") or ""
+                trigger = s.get("trigger", "")
+                print(f"  {i+1:3}  {s['id']:<35} {s.get('file_count', 0):>5} {size_str:>8} {trigger:<12} {label}{marker}")
+
+        elif subcmd == "create":
+            label = parts[2] if len(parts) > 2 else None
+            snap_id = engine.snapshot(label=label, trigger="manual")
+            if snap_id:
+                print(f"  ✅ Snapshot created: {snap_id}")
+            else:
+                print("  ⚠️  State unchanged — snapshot skipped (dedup).")
+
+        elif subcmd in ("rewind", "restore"):
+            if len(parts) < 3:
+                print("  Usage: /snapshot rewind <snapshot-id>")
+                return
+            snap_id = parts[2]
+            if engine.restore(snap_id):
+                print(f"  ✅ Restored state from: {snap_id}")
+                print("  ⚠️  Restart recommended for state.db changes to take effect.")
+            else:
+                print(f"  ❌ Snapshot not found: {snap_id}")
+
+        elif subcmd == "diff":
+            if len(parts) < 4:
+                print("  Usage: /snapshot diff <snap-a> <snap-b>")
+                snaps = engine.list_snapshots(limit=5)
+                if len(snaps) >= 2:
+                    print(f"  Tip: most recent are '{snaps[0]['id']}' and '{snaps[1]['id']}'")
+                return
+            result = engine.diff(parts[2], parts[3])
+            if not result["changed"] and not result["added"] and not result["removed"]:
+                print("  No differences.")
+            else:
+                for f in result["changed"]:
+                    print(f"  ~ {f}")
+                for f in result["added"]:
+                    print(f"  + {f}")
+                for f in result["removed"]:
+                    print(f"  - {f}")
+
+        elif subcmd == "prune":
+            deleted = engine.prune()
+            print(f"  🧹 Pruned {deleted} old snapshots.")
+
+        elif subcmd == "head":
+            head = engine.get_head()
+            if head:
+                print(f"  HEAD: {head}")
+            else:
+                print("  No snapshots yet.")
+
+        else:
+            print(f"  Unknown subcommand: {subcmd}")
+            print("  Usage: /snapshot [list|create|rewind <id>|diff <a> <b>|prune|head]")
+
     def _handle_stop_command(self):
         """Handle /stop — kill all running background processes.
 
@@ -5383,6 +5469,8 @@ class HermesCLI:
                 print(f"Plugin system error: {e}")
         elif canonical == "rollback":
             self._handle_rollback_command(cmd_original)
+        elif canonical == "snapshot":
+            self._handle_snapshot_command(cmd_original)
         elif canonical == "stop":
             self._handle_stop_command()
         elif canonical == "background":

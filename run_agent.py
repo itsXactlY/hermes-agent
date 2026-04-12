@@ -6731,6 +6731,12 @@ class AIAgent:
                     )
                 except Exception:
                     pass
+            # Runtime snapshot: memory write detected
+            try:
+                from tools.snapshot_engine import auto_snapshot
+                auto_snapshot(trigger="memory_write")
+            except Exception:
+                pass
             return result
         elif self._memory_manager and self._memory_manager.has_tool(function_name):
             return self._memory_manager.handle_tool_call(function_name, function_args)
@@ -6964,6 +6970,12 @@ class AIAgent:
         if num_tools > 0:
             turn_tool_msgs = messages[-num_tools:]
             enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id))
+            # Runtime snapshot: concurrent tool execution batch completed
+            try:
+                from tools.snapshot_engine import auto_snapshot
+                auto_snapshot(trigger="tool_result")
+            except Exception:
+                pass
 
     def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
@@ -7310,6 +7322,12 @@ class AIAgent:
         num_tools_seq = len(assistant_message.tool_calls)
         if num_tools_seq > 0:
             enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id))
+            # Runtime snapshot: tool execution batch completed
+            try:
+                from tools.snapshot_engine import auto_snapshot
+                auto_snapshot(trigger="tool_result")
+            except Exception:
+                pass
 
 
 
