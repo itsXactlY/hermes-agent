@@ -8,7 +8,9 @@ Key concepts:
   - objects/: SHA256-addressed blob store (deduplication)
   - snapshots/: Per-snapshot manifest.json + meta.json
   - history.db: SQLite index for fast queries
+  - wal/: Write-ahead log for zero-loss between snapshots
   - Debounced auto-snapshots (30s default, 15s for memory writes)
+  - Branching for safe upgrade experiments
 
 Usage:
   from tools.snapshot_engine import SnapshotEngine, auto_snapshot, safe_run
@@ -24,12 +26,16 @@ Usage:
 
   # Transaction
   result = safe_run(my_function, label="dangerous-op")
+
+  # Branching
+  engine.create_branch("pre-update-v2")
+  engine.switch_branch("pre-update-v2")
+  engine.list_branches()
 """
 
 import hashlib
 import json
 import logging
-import os
 import shutil
 import sqlite3
 import threading
@@ -136,13 +142,22 @@ class SnapshotEngine:
         self.snapshots_dir = self.store / "snapshots"
         self.head_file = self.store / "HEAD"
         self.history_db = self.store / "history.db"
+        self.wal_dir = self.store / "wal"
+        self.branches_dir = self.store / "branches"
+        self.branch_head = self.store / "BRANCH_HEAD"
 
         # Ensure directories exist
         self.objects.mkdir(parents=True, exist_ok=True)
         self.snapshots_dir.mkdir(parents=True, exist_ok=True)
+        self.wal_dir.mkdir(parents=True, exist_ok=True)
+        self.branches_dir.mkdir(parents=True, exist_ok=True)
 
         # Initialize history DB
         self._init_history_db()
+
+        # Initialize default branch if none exists
+        if not self.branch_head.exists():
+            self.branch_head.write_text("main")
 
     def _init_history_db(self) -> None:
         """Create the snapshot index database."""
@@ -157,7 +172,8 @@ class SnapshotEngine:
                 file_count INTEGER,
                 total_size INTEGER,
                 unique_objects INTEGER,
-                created_at REAL NOT NULL
+                created_at REAL NOT NULL,
+                branch TEXT DEFAULT 'main'
             )
         """)
         conn.execute("""
@@ -173,6 +189,26 @@ class SnapshotEngine:
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_snapshots_time
             ON snapshots(timestamp)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_snapshots_branch
+            ON snapshots(branch)
+        """)
+        # WAL table — append-only log of individual state changes between snapshots
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS wal_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                rel_path TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                branch TEXT NOT NULL DEFAULT 'main',
+                snapshot_id TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_wal_unflushed
+            ON wal_entries(snapshot_id) WHERE snapshot_id IS NULL
         """)
         conn.commit()
         conn.close()
@@ -215,6 +251,261 @@ class SnapshotEngine:
         if obj_path.exists():
             return obj_path.read_bytes()
         return None
+
+    # -- Write-Ahead Log -----------------------------------------------------
+
+    def wal_append(self, rel_path: str, data: bytes) -> None:
+        """Append a state change to the WAL.
+
+        Call this for every individual state mutation (not just on snapshot).
+        This ensures zero data loss between debounced snapshots.
+        """
+        sha = self._store_object(data)
+        branch = self.get_branch()
+        try:
+            conn = sqlite3.connect(str(self.history_db))
+            conn.execute(
+                "INSERT INTO wal_entries (timestamp, rel_path, sha256, size, branch) VALUES (?, ?, ?, ?, ?)",
+                (time.time(), rel_path, sha, len(data), branch),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning("WAL append failed for %s: %s", rel_path, e)
+
+    def wal_append_file(self, rel_path: str, abs_path: Path) -> None:
+        """Append a file's contents to the WAL."""
+        try:
+            if abs_path.name == "state.db":
+                # Safe copy for SQLite
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+                    tmp_path = Path(tmp.name)
+                if self._safe_copy_db(abs_path, tmp_path):
+                    self.wal_append(rel_path, tmp_path.read_bytes())
+                    tmp_path.unlink(missing_ok=True)
+            else:
+                self.wal_append(rel_path, abs_path.read_bytes())
+        except Exception as e:
+            logger.warning("WAL append_file failed for %s: %s", rel_path, e)
+
+    def wal_flush(self, snapshot_id: str) -> int:
+        """Mark all unflushed WAL entries as belonging to a snapshot.
+
+        Returns count of flushed entries.
+        """
+        try:
+            conn = sqlite3.connect(str(self.history_db))
+            cur = conn.execute(
+                "UPDATE wal_entries SET snapshot_id = ? WHERE snapshot_id IS NULL",
+                (snapshot_id,),
+            )
+            count = cur.rowcount
+            conn.commit()
+            conn.close()
+            return count
+        except Exception as e:
+            logger.warning("WAL flush failed: %s", e)
+            return 0
+
+    def wal_unflushed(self) -> List[Dict[str, Any]]:
+        """Get all unflushed WAL entries (changes since last snapshot)."""
+        try:
+            conn = sqlite3.connect(str(self.history_db))
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM wal_entries WHERE snapshot_id IS NULL ORDER BY id"
+            ).fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+    def wal_replay(self) -> List[str]:
+        """Replay unflushed WAL entries into the live state.
+
+        Used on startup after a crash — restores state changes that happened
+        between the last snapshot and the crash.
+
+        Returns list of restored file paths.
+        """
+        entries = self.wal_unflushed()
+        if not entries:
+            return []
+
+        # Deduplicate: keep only the latest version of each file
+        latest: Dict[str, str] = {}  # rel_path -> sha256
+        for e in entries:
+            latest[e["rel_path"]] = e["sha256"]
+
+        restored = []
+        for rel_path, sha in latest.items():
+            obj_path = self.objects / sha[:2] / sha[2:]
+            if not obj_path.exists():
+                continue
+            target = self.hermes_home / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if target.name == "state.db":
+                    tmp_path = target.parent / f".{target.name}.wal_replay"
+                    shutil.copy2(obj_path, tmp_path)
+                    target.unlink(missing_ok=True)
+                    shutil.move(str(tmp_path), str(target))
+                else:
+                    shutil.copy2(obj_path, target)
+                restored.append(rel_path)
+            except Exception as e:
+                logger.error("WAL replay failed for %s: %s", rel_path, e)
+
+        logger.info("WAL replay: restored %d files from %d entries", len(restored), len(entries))
+        return restored
+
+    def wal_prune(self, older_than_hours: int = 72) -> int:
+        """Remove flushed WAL entries older than N hours. Returns count removed."""
+        cutoff = time.time() - (older_than_hours * 3600)
+        try:
+            conn = sqlite3.connect(str(self.history_db))
+            cur = conn.execute(
+                "DELETE FROM wal_entries WHERE snapshot_id IS NOT NULL AND timestamp < ?",
+                (cutoff,),
+            )
+            count = cur.rowcount
+            conn.commit()
+            conn.close()
+            return count
+        except Exception:
+            return 0
+
+    # -- Branching -----------------------------------------------------------
+
+    def get_branch(self) -> str:
+        """Get the current branch name."""
+        try:
+            return self.branch_head.read_text().strip()
+        except (FileNotFoundError, OSError):
+            return "main"
+
+    def create_branch(self, name: str, from_snapshot: Optional[str] = None) -> bool:
+        """Create a new branch.
+
+        Args:
+            name: Branch name (alphanumeric + hyphens/underscores)
+            from_snapshot: Optional snapshot to branch from (default: current HEAD)
+
+        Returns:
+            True if branch created successfully.
+        """
+        import re
+        if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+            logger.error("Invalid branch name: %s", name)
+            return False
+
+        branch_file = self.branches_dir / name
+        if branch_file.exists():
+            logger.error("Branch already exists: %s", name)
+            return False
+
+        # Determine the snapshot to point at
+        if from_snapshot:
+            snap_id = from_snapshot
+        else:
+            snap_id = self.get_head()
+
+        # Write branch ref (points to a snapshot ID)
+        branch_file.write_text(snap_id or "")
+        logger.info("Created branch '%s' at %s", name, snap_id)
+        return True
+
+    def switch_branch(self, name: str) -> bool:
+        """Switch to a branch. Restores state from the branch's HEAD snapshot.
+
+        Args:
+            name: Branch name to switch to.
+
+        Returns:
+            True if switched successfully.
+        """
+        branch_file = self.branches_dir / name
+        if not branch_file.exists():
+            logger.error("Branch not found: %s", name)
+            return False
+
+        snap_id = branch_file.read_text().strip()
+
+        # Snapshot current state on current branch before switching
+        current_branch = self.get_branch()
+        if current_branch != name:
+            self.snapshot(label=f"branch-switch-from-{current_branch}", trigger="branch_switch")
+
+        # Switch branch
+        self.branch_head.write_text(name)
+
+        # Restore branch state if it has a snapshot
+        if snap_id:
+            self.restore(snap_id)
+
+        logger.info("Switched to branch '%s' (snapshot: %s)", name, snap_id or "none")
+        return True
+
+    def delete_branch(self, name: str) -> bool:
+        """Delete a branch. Cannot delete the current branch or 'main'.
+
+        Args:
+            name: Branch name to delete.
+
+        Returns:
+            True if deleted.
+        """
+        if name == "main":
+            logger.error("Cannot delete 'main' branch")
+            return False
+        if name == self.get_branch():
+            logger.error("Cannot delete active branch — switch first")
+            return False
+
+        branch_file = self.branches_dir / name
+        if not branch_file.exists():
+            logger.error("Branch not found: %s", name)
+            return False
+
+        branch_file.unlink()
+        logger.info("Deleted branch '%s'", name)
+        return True
+
+    def list_branches(self) -> List[Dict[str, Any]]:
+        """List all branches with their HEAD snapshot and status."""
+        current = self.get_branch()
+        branches = []
+
+        # Always include main
+        main_snap = ""
+        main_file = self.branches_dir / "main"
+        if main_file.exists():
+            main_snap = main_file.read_text().strip()
+        branches.append({
+            "name": "main",
+            "head_snapshot": main_snap,
+            "is_current": current == "main",
+        })
+
+        # Other branches
+        if self.branches_dir.exists():
+            for bf in sorted(self.branches_dir.iterdir()):
+                if bf.is_file() and bf.name != "main":
+                    branches.append({
+                        "name": bf.name,
+                        "head_snapshot": bf.read_text().strip(),
+                        "is_current": current == bf.name,
+                    })
+
+        return branches
+
+    def update_branch_head(self, snap_id: str) -> None:
+        """Update the current branch's HEAD to the given snapshot."""
+        branch = self.get_branch()
+        branch_file = self.branches_dir / branch
+        branch_file.parent.mkdir(parents=True, exist_ok=True)
+        branch_file.write_text(snap_id)
 
     # -- SQLite safe copy ----------------------------------------------------
 
@@ -348,6 +639,7 @@ class SnapshotEngine:
             json.dump(manifest, f, indent=2)
 
         # Write metadata
+        branch = self.get_branch()
         meta = {
             "id": snap_id,
             "timestamp": ts,
@@ -357,6 +649,7 @@ class SnapshotEngine:
             "total_size": total_size,
             "unique_objects": len(unique_hashes),
             "state_hash": state_hash,
+            "branch": branch,
         }
         with open(snap_dir / "meta.json", "w") as f:
             json.dump(meta, f, indent=2)
@@ -364,13 +657,19 @@ class SnapshotEngine:
         # Update HEAD
         self.head_file.write_text(snap_id)
 
+        # Update branch HEAD
+        self.update_branch_head(snap_id)
+
+        # WAL flush — mark unflushed entries as belonging to this snapshot
+        wal_count = self.wal_flush(snap_id)
+
         # Update history DB
         try:
             conn = sqlite3.connect(str(self.history_db))
             conn.execute(
-                "INSERT OR REPLACE INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (snap_id, ts, label, trigger, len(manifest), total_size,
-                 len(unique_hashes), time.time()),
+                 len(unique_hashes), time.time(), branch),
             )
             for rel_path, sha in manifest.items():
                 conn.execute(
@@ -386,8 +685,8 @@ class SnapshotEngine:
         _update_state_hash(state_hash)
 
         logger.info(
-            "Snapshot %s: %d files, %d unique objects, %s trigger",
-            snap_id, len(manifest), len(unique_hashes), trigger,
+            "Snapshot %s: %d files, %d unique objects, %s trigger, %d WAL flushed",
+            snap_id, len(manifest), len(unique_hashes), trigger, wal_count,
         )
         return snap_id
 
@@ -454,18 +753,28 @@ class SnapshotEngine:
         except (FileNotFoundError, OSError):
             return None
 
-    def list_snapshots(self, limit: int = 50) -> List[Dict[str, Any]]:
+    def list_snapshots(self, limit: int = 50, branch: Optional[str] = None) -> List[Dict[str, Any]]:
         """List recent snapshots with metadata.
+
+        Args:
+            limit: Max snapshots to return.
+            branch: Filter by branch name (None = all branches).
 
         Returns most recent first.
         """
         try:
             conn = sqlite3.connect(str(self.history_db))
             conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT * FROM snapshots ORDER BY timestamp DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            if branch:
+                rows = conn.execute(
+                    "SELECT * FROM snapshots WHERE branch = ? ORDER BY timestamp DESC LIMIT ?",
+                    (branch, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM snapshots ORDER BY timestamp DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
             conn.close()
             return [dict(r) for r in rows]
         except Exception:
@@ -526,14 +835,15 @@ class SnapshotEngine:
         self,
         keep_last: int = 100,
         keep_hourly: int = 24,
-        keep_daily: int = 30,
+        keep_daily: int = 3,
     ) -> int:
         """Prune old snapshots. Returns count of deleted snapshots.
 
         Strategy:
           - Always keep the last `keep_last` snapshots
           - Keep one per hour for the last `keep_hourly` hours
-          - Keep one per day for the last `keep_daily` days
+          - Keep one per day for the last `keep_daily` days (default: 3)
+          - NEVER prune snapshots on non-main branches (safety for upgrade experiments)
           - Delete the rest
         """
         snaps = self.list_snapshots(limit=10000)
@@ -565,9 +875,15 @@ class SnapshotEngine:
                 seen_days.add(day_key)
 
         # Delete everything not in keep set
+        # NEVER delete snapshots on non-main branches (safety for upgrade experiments)
+        non_main_snaps: Set[str] = set()
+        for s in snaps:
+            if s.get("branch", "main") != "main":
+                non_main_snaps.add(s["id"])
+
         deleted = 0
         for s in snaps:
-            if s["id"] not in keep:
+            if s["id"] not in keep and s["id"] not in non_main_snaps:
                 snap_dir = self.snapshots_dir / s["id"]
                 if snap_dir.exists():
                     shutil.rmtree(snap_dir, ignore_errors=True)
@@ -578,7 +894,7 @@ class SnapshotEngine:
             try:
                 conn = sqlite3.connect(str(self.history_db))
                 for s in snaps:
-                    if s["id"] not in keep:
+                    if s["id"] not in keep and s["id"] not in non_main_snaps:
                         conn.execute("DELETE FROM snapshot_files WHERE snapshot_id = ?", (s["id"],))
                         conn.execute("DELETE FROM snapshots WHERE id = ?", (s["id"],))
                 conn.commit()
@@ -589,7 +905,13 @@ class SnapshotEngine:
         # Clean orphaned objects (optional — run occasionally)
         self._clean_orphaned_objects()
 
-        logger.info("Pruned %d snapshots (kept %d)", deleted, len(keep))
+        # Also prune old WAL entries (flushed, >72h)
+        wal_pruned = self.wal_prune(older_than_hours=72)
+
+        logger.info(
+            "Pruned %d snapshots (kept %d, protected %d branch snaps), %d WAL entries",
+            deleted, len(keep), len(non_main_snaps), wal_pruned,
+        )
         return deleted
 
     def _clean_orphaned_objects(self) -> int:
@@ -720,6 +1042,51 @@ def diff(snap_id_a: str, snap_id_b: str) -> Dict[str, Any]:
     return _get_engine().diff(snap_id_a, snap_id_b)
 
 
-def prune(keep_last: int = 100, keep_hourly: int = 24, keep_daily: int = 30) -> int:
+def prune(keep_last: int = 100, keep_hourly: int = 24, keep_daily: int = 3) -> int:
     """Prune old snapshots. Shorthand for engine.prune()."""
     return _get_engine().prune(keep_last=keep_last, keep_hourly=keep_hourly, keep_daily=keep_daily)
+
+
+def wal_append(rel_path: str, data: bytes) -> None:
+    """Append to the WAL. Shorthand for engine.wal_append()."""
+    _get_engine().wal_append(rel_path, data)
+
+
+def wal_append_file(rel_path: str, abs_path: Path) -> None:
+    """Append a file to the WAL. Shorthand for engine.wal_append_file()."""
+    _get_engine().wal_append_file(rel_path, abs_path)
+
+
+def wal_replay() -> List[str]:
+    """Replay unflushed WAL. Shorthand for engine.wal_replay()."""
+    return _get_engine().wal_replay()
+
+
+def wal_unflushed() -> List[Dict[str, Any]]:
+    """Get unflushed WAL entries. Shorthand for engine.wal_unflushed()."""
+    return _get_engine().wal_unflushed()
+
+
+def create_branch(name: str, from_snapshot: Optional[str] = None) -> bool:
+    """Create a branch. Shorthand for engine.create_branch()."""
+    return _get_engine().create_branch(name, from_snapshot=from_snapshot)
+
+
+def switch_branch(name: str) -> bool:
+    """Switch branch. Shorthand for engine.switch_branch()."""
+    return _get_engine().switch_branch(name)
+
+
+def delete_branch(name: str) -> bool:
+    """Delete a branch. Shorthand for engine.delete_branch()."""
+    return _get_engine().delete_branch(name)
+
+
+def list_branches() -> List[Dict[str, Any]]:
+    """List branches. Shorthand for engine.list_branches()."""
+    return _get_engine().list_branches()
+
+
+def get_branch() -> str:
+    """Get current branch. Shorthand for engine.get_branch()."""
+    return _get_engine().get_branch()

@@ -3355,15 +3355,21 @@ class HermesCLI:
             return ref
 
     def _handle_snapshot_command(self, command: str):
-        """Handle /snapshot — runtime state snapshots.
+        """Handle /snapshot — runtime state snapshots + branching + WAL.
 
         Syntax:
-            /snapshot                  — list recent snapshots
-            /snapshot create [label]   — create a snapshot
-            /snapshot rewind <id>      — restore state from snapshot
-            /snapshot diff <a> <b>     — compare two snapshots
-            /snapshot prune            — clean up old snapshots
-            /snapshot head             — show current HEAD snapshot
+            /snapshot                          — list recent snapshots
+            /snapshot create [label]           — create a snapshot
+            /snapshot rewind <id>              — restore state from snapshot
+            /snapshot diff <a> <b>             — compare two snapshots
+            /snapshot prune                    — clean up old snapshots (keeps 3 days)
+            /snapshot head                     — show current HEAD snapshot
+            /snapshot branch                   — list branches + show current
+            /snapshot branch <name>            — create new branch (from HEAD)
+            /snapshot branch switch <name>     — switch to branch
+            /snapshot branch delete <name>     — delete branch (not main, not active)
+            /snapshot wal                      — show unflushed WAL entries
+            /snapshot wal replay               — replay WAL (crash recovery)
         """
         from tools.snapshot_engine import SnapshotEngine
 
@@ -3372,21 +3378,25 @@ class HermesCLI:
         subcmd = parts[1].lower() if len(parts) > 1 else "list"
 
         if subcmd in ("list", "ls"):
-            snaps = engine.list_snapshots(limit=20)
+            branch = parts[2] if len(parts) > 2 and parts[2] not in ("--all",) else None
+            snaps = engine.list_snapshots(limit=20, branch=branch)
             if not snaps:
                 print("  No snapshots yet.")
                 print("  Create one: /snapshot create [label]")
                 return
             head = engine.get_head()
-            print(f"  {'':3}  {'ID':<35} {'Files':>5} {'Size':>8} {'Trigger':<12} {'Label'}")
-            print(f"  {'':3}  {'─'*35} {'─'*5} {'─'*8} {'─'*12} {'─'*20}")
+            current_branch = engine.get_branch()
+            print(f"  Branch: {current_branch}")
+            print(f"  {'':3}  {'ID':<35} {'Files':>5} {'Size':>8} {'Trigger':<12} {'Branch':<10} {'Label'}")
+            print(f"  {'':3}  {'─'*35} {'─'*5} {'─'*8} {'─'*12} {'─'*10} {'─'*20}")
             for i, s in enumerate(snaps):
                 marker = " ◀" if s["id"] == head else ""
                 size = s.get("total_size", 0)
                 size_str = f"{size/1024:.0f}KB" if size < 1024*1024 else f"{size/1024/1024:.1f}MB"
                 label = s.get("label") or ""
                 trigger = s.get("trigger", "")
-                print(f"  {i+1:3}  {s['id']:<35} {s.get('file_count', 0):>5} {size_str:>8} {trigger:<12} {label}{marker}")
+                branch_name = s.get("branch", "main") or "main"
+                print(f"  {i+1:3}  {s['id']:<35} {s.get('file_count', 0):>5} {size_str:>8} {trigger:<12} {branch_name:<10} {label}{marker}")
 
         elif subcmd == "create":
             label = parts[2] if len(parts) > 2 else None
@@ -3427,18 +3437,88 @@ class HermesCLI:
 
         elif subcmd == "prune":
             deleted = engine.prune()
-            print(f"  🧹 Pruned {deleted} old snapshots.")
+            print(f"  🧹 Pruned {deleted} old snapshots (3-day retention).")
 
         elif subcmd == "head":
             head = engine.get_head()
+            branch = engine.get_branch()
             if head:
-                print(f"  HEAD: {head}")
+                print(f"  HEAD: {head} (branch: {branch})")
             else:
-                print("  No snapshots yet.")
+                print(f"  No snapshots yet (branch: {branch})")
+
+        elif subcmd == "branch":
+            # /snapshot branch — list
+            # /snapshot branch <name> — create
+            # /snapshot branch switch <name>
+            # /snapshot branch delete <name>
+            if len(parts) < 3:
+                # List branches
+                branches = engine.list_branches()
+                print(f"  {'Branch':<20} {'HEAD Snapshot':<40} {'Status'}")
+                print(f"  {'─'*20} {'─'*40} {'─'*10}")
+                for b in branches:
+                    current = " ◀ active" if b["is_current"] else ""
+                    snap = b["head_snapshot"] or "(empty)"
+                    print(f"  {b['name']:<20} {snap:<40} {current}")
+                return
+
+            branch_action = parts[2].lower()
+            if branch_action == "switch":
+                if len(parts) < 4:
+                    print("  Usage: /snapshot branch switch <name>")
+                    return
+                name = parts[3]
+                if engine.switch_branch(name):
+                    print(f"  ✅ Switched to branch '{name}'")
+                else:
+                    print(f"  ❌ Branch not found: {name}")
+            elif branch_action == "delete":
+                if len(parts) < 4:
+                    print("  Usage: /snapshot branch delete <name>")
+                    return
+                name = parts[3]
+                if engine.delete_branch(name):
+                    print(f"  ✅ Deleted branch '{name}'")
+                else:
+                    print(f"  ❌ Cannot delete branch '{name}' (protected or not found)")
+            else:
+                # Create branch
+                name = parts[2]
+                from_snap = parts[3] if len(parts) > 3 else None
+                if engine.create_branch(name, from_snapshot=from_snap):
+                    print(f"  ✅ Created branch '{name}'" +
+                          (f" from {from_snap}" if from_snap else f" from HEAD"))
+                else:
+                    print(f"  ❌ Cannot create branch '{name}' (invalid name or already exists)")
+
+        elif subcmd == "wal":
+            wal_action = parts[2].lower() if len(parts) > 2 else "status"
+            if wal_action == "replay":
+                restored = engine.wal_replay()
+                if restored:
+                    print(f"  ✅ WAL replay restored {len(restored)} files:")
+                    for f in restored:
+                        print(f"    • {f}")
+                else:
+                    print("  No unflushed WAL entries — nothing to replay.")
+            elif wal_action == "status":
+                entries = engine.wal_unflushed()
+                if not entries:
+                    print("  WAL is clean — no unflushed entries.")
+                else:
+                    print(f"  WAL: {len(entries)} unflushed entries")
+                    # Deduplicate for display
+                    files = set(e["rel_path"] for e in entries)
+                    for f in sorted(files):
+                        print(f"    • {f}")
+                    print(f"  Replay: /snapshot wal replay")
+            else:
+                print("  Usage: /snapshot wal [status|replay]")
 
         else:
             print(f"  Unknown subcommand: {subcmd}")
-            print("  Usage: /snapshot [list|create|rewind <id>|diff <a> <b>|prune|head]")
+            print("  Usage: /snapshot [list|create|rewind <id>|diff <a> <b>|prune|head|branch|wal]")
 
     def _handle_stop_command(self):
         """Handle /stop — kill all running background processes.
