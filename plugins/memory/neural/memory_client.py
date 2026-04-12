@@ -32,15 +32,11 @@ def _find_lib():
 # ============================================================================
 
 class CSearchResult(ctypes.Structure):
-    """Must match NeuralMemoryResult in c_api.h exactly."""
     _fields_ = [
         ("id", ctypes.c_uint64),
-        ("embedding", ctypes.POINTER(ctypes.c_float)),
-        ("embedding_dim", ctypes.c_int),
+        ("score", ctypes.c_float),
         ("label", ctypes.c_char * 256),
-        ("content", ctypes.c_char * 4096),
-        ("similarity", ctypes.c_float),
-        ("salience", ctypes.c_float),
+        ("content", ctypes.c_char * 1024),
     ]
 
 class CStats(ctypes.Structure):
