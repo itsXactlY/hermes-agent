@@ -18,7 +18,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +268,34 @@ class DreamMSSQLStore:
             delta, delta, source_id, target_id
         )
         self.conn.commit()
+
+    def batch_strengthen_connections(self, edges: List[Tuple[int, int]],
+                                      delta: float = 0.05) -> int:
+        """Bulk strengthen connections. Returns count updated."""
+        if not edges:
+            return 0
+        cursor = self.conn.cursor()
+        cursor.executemany(
+            "UPDATE connections SET weight = CASE "
+            "WHEN weight + ? > 1.0 THEN 1.0 ELSE weight + ? END "
+            "WHERE source_id = ? AND target_id = ?",
+            [(delta, delta, src, tgt) for src, tgt in edges]
+        )
+        self.conn.commit()
+        return len(edges)
+
+    def batch_weaken_connections(self, threshold: float = 0.05,
+                                  delta: float = 0.01) -> int:
+        """Bulk weaken all connections above threshold in one UPDATE."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE connections SET weight = CASE "
+            "WHEN weight - ? < 0.0 THEN 0.0 ELSE weight - ? END "
+            "WHERE weight > ?",
+            delta, delta, threshold
+        )
+        self.conn.commit()
+        return cursor.rowcount
 
     def add_bridge(self, source_id: int, target_id: int,
                     weight: float = 0.3) -> None:
