@@ -299,28 +299,22 @@ class NeuralMemoryProvider(MemoryProvider):
                             parts.append(content[:200])
                             seen_contents.add(content[:100])
 
-            # 2. Recent memories — just grab last 5 from DB regardless of query
+            # 2. Recent memories — use store.get_all() (thread-safe, backend-agnostic)
             try:
-                import sqlite3
-                db_path = self._config.get("db_path", "")
-                if db_path:
-                    conn = sqlite3.connect(db_path)
-                    conn.row_factory = sqlite3.Row
-                    rows = conn.execute(
-                        "SELECT content, label FROM memories "
-                        "WHERE label NOT LIKE 'memory-%' "
-                        "ORDER BY created_at DESC LIMIT 8"
-                    ).fetchall()
-                    for row in rows:
-                        content = row["content"] or ""
-                        # Skip meta-garbage and very short content
-                        if len(content) < 30:
-                            continue
-                        c100 = content[:100]
-                        if c100 not in seen_contents and not self._is_garbage(content):
-                            parts.append(content[:200])
-                            seen_contents.add(c100)
-                    conn.close()
+                all_mems = self._memory.store.get_all()
+                # Sort by ID descending to get recent ones
+                recent = sorted(all_mems, key=lambda m: m.get("id", 0), reverse=True)[:8]
+                for mem in recent:
+                    content = mem.get("content", "") or ""
+                    if len(content) < 30:
+                        continue
+                    label = mem.get("label", "")
+                    if label.startswith("memory-"):
+                        continue
+                    c100 = content[:100]
+                    if c100 not in seen_contents and not self._is_garbage(content):
+                        parts.append(content[:200])
+                        seen_contents.add(c100)
             except Exception:
                 pass
 
