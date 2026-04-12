@@ -2735,6 +2735,22 @@ class HermesCLI:
         if runtime_model and isinstance(runtime_model, str):
             self.model = runtime_model
 
+        # If model is still empty (e.g. user ran `hermes auth add openai-codex`
+        # without `hermes model`), fall back to the provider's first catalog
+        # model so the API call doesn't fail with "model must be non-empty".
+        if not self.model and resolved_provider:
+            try:
+                from hermes_cli.models import get_default_model_for_provider
+                _default = get_default_model_for_provider(resolved_provider)
+                if _default:
+                    self.model = _default
+                    logger.info(
+                        "No model configured — defaulting to %s for provider %s",
+                        _default, resolved_provider,
+                    )
+            except Exception:
+                pass
+
         # Normalize model for the resolved provider (e.g. swap non-Codex
         # models when provider is openai-codex).  Fixes #651.
         model_changed = self._normalize_model_for_provider(resolved_provider)
@@ -5244,9 +5260,33 @@ class HermesCLI:
                         context_length=ctx_len,
                     )
                 _cprint("  ✨ (◕‿◕)✨ Fresh start! Screen cleared and conversation reset.\n")
+                # Show a random tip on new session
+                try:
+                    from hermes_cli.tips import get_random_tip
+                    _tip = get_random_tip()
+                    try:
+                        from hermes_cli.skin_engine import get_active_skin
+                        _tip_color = get_active_skin().get_color("banner_dim", "#B8860B")
+                    except Exception:
+                        _tip_color = "#B8860B"
+                    cc.print(f"[dim {_tip_color}]✦ Tip: {_tip}[/]")
+                except Exception:
+                    pass
             else:
                 self.show_banner()
                 print("  ✨ (◕‿◕)✨ Fresh start! Screen cleared and conversation reset.\n")
+                # Show a random tip on new session
+                try:
+                    from hermes_cli.tips import get_random_tip
+                    _tip = get_random_tip()
+                    try:
+                        from hermes_cli.skin_engine import get_active_skin
+                        _tip_color = get_active_skin().get_color("banner_dim", "#B8860B")
+                    except Exception:
+                        _tip_color = "#B8860B"
+                    self.console.print(f"[dim {_tip_color}]✦ Tip: {_tip}[/]")
+                except Exception:
+                    pass
         elif canonical == "history":
             self.show_history()
         elif canonical == "title":
@@ -8075,6 +8115,17 @@ class HermesCLI:
             _welcome_text = "Welcome to Hermes Agent! Type your message or /help for commands."
             _welcome_color = "#FFF8DC"
         self.console.print(f"[{_welcome_color}]{_welcome_text}[/]")
+        # Show a random tip to help users discover features
+        try:
+            from hermes_cli.tips import get_random_tip
+            _tip = get_random_tip()
+            try:
+                _tip_color = _welcome_skin.get_color("banner_dim", "#B8860B")
+            except Exception:
+                _tip_color = "#B8860B"
+            self.console.print(f"[dim {_tip_color}]✦ Tip: {_tip}[/]")
+        except Exception:
+            pass  # Tips are non-critical — never break startup
         if self.preloaded_skills and not self._startup_skills_line_shown:
             skills_label = ", ".join(self.preloaded_skills)
             self.console.print(
@@ -9350,9 +9401,14 @@ class HermesCLI:
                                 from tools.process_registry import process_registry
                                 if not process_registry.completion_queue.empty():
                                     evt = process_registry.completion_queue.get_nowait()
-                                    _synth = _format_process_notification(evt)
-                                    if _synth:
-                                        self._pending_input.put(_synth)
+                                    # Skip if the agent already consumed this via wait/poll/log
+                                    _evt_sid = evt.get("session_id", "")
+                                    if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
+                                        pass  # already delivered via tool result
+                                    else:
+                                        _synth = _format_process_notification(evt)
+                                        if _synth:
+                                            self._pending_input.put(_synth)
                             except Exception:
                                 pass
                         continue
@@ -9478,6 +9534,10 @@ class HermesCLI:
                             from tools.process_registry import process_registry
                             while not process_registry.completion_queue.empty():
                                 evt = process_registry.completion_queue.get_nowait()
+                                # Skip if the agent already consumed this via wait/poll/log
+                                _evt_sid = evt.get("session_id", "")
+                                if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
+                                    continue  # already delivered via tool result
                                 _synth = _format_process_notification(evt)
                                 if _synth:
                                     self._pending_input.put(_synth)
