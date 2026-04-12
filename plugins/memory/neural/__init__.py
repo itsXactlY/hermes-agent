@@ -221,7 +221,23 @@ class NeuralMemoryProvider(MemoryProvider):
         "as mentioned in my",
         "according to my memory",
         "i recall from",
+        "welcome to hermes agent",
+        "type your message or /help",
+        "initializing agent",
+        "loading weights",
+        "embedding backend:",
+        "all-minilm-l6-v2 ready",
+        "bertmodel load report",
+        "unexpected:",
+        "reasoning-budget:",
+        "╭─", "╰─", "┌─", "└─",
+        "batches:",
     )
+
+    # Patterns that indicate the text is NOT a useful memory (banner/log/config)
+    _NOISE_LABELS = frozenset({
+        "pre-compress",
+    })
 
     def __init__(self) -> None:
         self._memory = None  # NeuralMemory instance
@@ -308,22 +324,34 @@ class NeuralMemoryProvider(MemoryProvider):
                             parts.append(content[:200])
                             seen_contents.add(content[:100])
 
-            # 2. Recent memories — use store.get_all() (thread-safe, backend-agnostic)
+            # 2. Recent QUALITY memories — use store.get_all()
             try:
                 all_mems = self._memory.store.get_all()
-                # Sort by ID descending to get recent ones
-                recent = sorted(all_mems, key=lambda m: m.get("id", 0), reverse=True)[:8]
+                # Sort by ID descending, then filter for quality
+                recent = sorted(all_mems, key=lambda m: m.get("id", 0), reverse=True)
+                quality_count = 0
                 for mem in recent:
+                    if quality_count >= 8:
+                        break
                     content = mem.get("content", "") or ""
                     if len(content) < 30:
                         continue
                     label = mem.get("label", "")
+                    # Skip noise labels (auto-saved turns, pre-compress dumps)
+                    if label in self._NOISE_LABELS:
+                        continue
                     if label.startswith("memory-"):
                         continue
+                    if self._is_garbage(content):
+                        continue
+                    # Skip old-format raw conversation dumps
+                    if content.startswith("User:") and "\nAssistant:" in content[:600]:
+                        continue
                     c100 = content[:100]
-                    if c100 not in seen_contents and not self._is_garbage(content):
+                    if c100 not in seen_contents:
                         parts.append(content[:200])
                         seen_contents.add(c100)
+                        quality_count += 1
             except Exception:
                 pass
 
@@ -482,14 +510,25 @@ class NeuralMemoryProvider(MemoryProvider):
 
         def _run():
             try:
-                results = self._memory.recall(query, k=limit)
+                results = self._memory.recall(query, k=limit * 2)  # fetch extra for filtering
                 if not results:
                     return
                 lines = []
                 for r in results:
                     sim = r.get("similarity", 0)
+                    if sim < 0.25:  # skip irrelevant results
+                        continue
+                    label = r.get("label", "")
+                    if label in self._NOISE_LABELS:  # skip noise
+                        continue
                     content = r.get("content", "")
+                    if self._is_garbage(content):
+                        continue
                     lines.append(f"- [{sim:.2f}] {content[:200]}")
+                    if len(lines) >= limit:
+                        break
+                if not lines:
+                    return
                 with self._lock:
                     self._prefetch_result = "\n".join(lines)
             except Exception as e:
@@ -517,13 +556,27 @@ class NeuralMemoryProvider(MemoryProvider):
         if self._is_garbage(assistant_content) and len(assistant_content) < 100:
             return None
 
-        user_clean = user_content[:300].strip()
+        user_clean = user_content[:500].strip()
         assist_clean = assistant_content[:500].strip()
 
         if len(user_clean) < 5:
             return None
 
-        return f"User: {user_clean}\nAssistant: {assist_clean}"
+        # Skip if assistant is just a boilerplate/greeting
+        assist_lower = assist_clean.lower() if assist_clean else ""
+        _boilerplate = (
+            "trallala", "welcome to hermes", "what stands today",
+            "type your message", "got it", "ok,", "sure",
+            "i understand", "let me know",
+        )
+        is_boilerplate = any(b in assist_lower for b in _boilerplate) and len(assist_clean) < 200
+
+        if is_boilerplate or not assist_clean:
+            # Store user content only — more focused embedding
+            return f"Topic: {user_clean[:300]}"
+
+        # Substantive exchange — store both but structured
+        return f"Topic: {user_clean[:200]}\nResult: {assist_clean[:300]}"
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Store the turn as an episodic memory. Skips meta-garbage."""
@@ -829,16 +882,32 @@ class NeuralMemoryProvider(MemoryProvider):
         try:
             query = args["query"]
             limit = int(args.get("limit", 5))
-            results = self._memory.recall(query, k=limit)
+            # Fetch extra for noise filtering
+            results = self._memory.recall(query, k=limit * 3)
             # Strip embedding vectors and connections — only send useful fields to LLM
             clean = []
             for r in results:
+                label = r.get("label", "")
+                # Skip noise memories
+                if label in self._NOISE_LABELS:
+                    continue
+                sim = r.get("similarity", 0)
+                if sim < 0.1:
+                    continue
+                content = r.get("content", "")[:500]
+                if self._is_garbage(content):
+                    continue
+                # Skip old-format raw conversation dumps
+                if content.startswith("User:") and "\nAssistant:" in content[:600]:
+                    continue
                 clean.append({
                     "id": r.get("id"),
-                    "label": r.get("label", ""),
-                    "content": r.get("content", "")[:500],
-                    "similarity": round(r.get("similarity", 0), 3),
+                    "label": label,
+                    "content": content,
+                    "similarity": round(sim, 3),
                 })
+                if len(clean) >= limit:
+                    break
             return json.dumps({"results": clean, "count": len(clean)})
         except KeyError as exc:
             return tool_error(f"Missing required argument: {exc}")
