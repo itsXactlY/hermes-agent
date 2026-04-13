@@ -347,6 +347,12 @@ class SnapshotEngine:
             target.parent.mkdir(parents=True, exist_ok=True)
             try:
                 if target.name == "state.db":
+                    # Remove old WAL/SHM files FIRST — they belong to the old
+                    # (possibly corrupted) DB and would corrupt the restored one.
+                    for suffix in ("-wal", "-shm"):
+                        old_aux = Path(str(target) + suffix)
+                        old_aux.unlink(missing_ok=True)
+
                     tmp_path = target.parent / f".{target.name}.wal_replay"
                     shutil.copy2(obj_path, tmp_path)
                     target.unlink(missing_ok=True)
@@ -514,23 +520,63 @@ class SnapshotEngine:
 
         Handles WAL mode — produces a consistent snapshot even while
         the DB is being written to by the agent.
+
+        Strategy:
+          1. Open src read-write (needed for WAL checkpoint)
+          2. PRAGMA wal_checkpoint(TRUNCATE) — flushes WAL into main DB
+          3. sqlite3.Connection.backup() — consistent copy
+          4. Verify backup integrity before accepting
         """
+        conn = None
+        backup_conn = None
         try:
-            conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+            # Step 1: Open read-write (checkpoint requires write access)
+            conn = sqlite3.connect(str(src), timeout=10)
+
+            # Step 2: WAL checkpoint — flush pending writes into main DB file.
+            # TRUNCATE ensures the WAL is emptied, so the .db file alone is
+            # sufficient for a consistent snapshot.
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.OperationalError:
+                # Checkpoint may fail if another writer holds the WAL.
+                # backup() can still handle this, so continue.
+                pass
+
+            # Step 3: SQLite backup API — the ONLY safe way to copy a live DB.
             backup_conn = sqlite3.connect(str(dst))
             conn.backup(backup_conn)
+
+            # Step 4: Verify backup integrity before accepting.
+            # A corrupt backup is worse than no backup.
+            integrity = backup_conn.execute("PRAGMA integrity_check").fetchone()[0]
             backup_conn.close()
+            backup_conn = None
             conn.close()
+            conn = None
+
+            if integrity != "ok":
+                logger.error("Backup integrity check failed for %s: %s", src, integrity)
+                dst.unlink(missing_ok=True)
+                return False
+
             return True
         except Exception as e:
-            logger.warning("SQLite safe copy failed for %s: %s", src, e)
-            # Fallback: raw copy (may have WAL inconsistencies, but better than nothing)
-            try:
-                shutil.copy2(src, dst)
-                return True
-            except Exception as e2:
-                logger.error("Raw copy also failed for %s: %s", src, e2)
-                return False
+            logger.error("SQLite safe copy failed for %s: %s", src, e)
+            dst.unlink(missing_ok=True)
+            return False
+        finally:
+            # Always clean up connections
+            if backup_conn is not None:
+                try:
+                    backup_conn.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     # -- Snapshot creation ---------------------------------------------------
 
@@ -727,6 +773,12 @@ class SnapshotEngine:
             try:
                 # For state.db, use the safe copy approach (write object to tmp, then restore)
                 if target.name == "state.db":
+                    # Remove old WAL/SHM files FIRST — they belong to the old
+                    # (possibly corrupted) DB and would corrupt the restored one.
+                    for suffix in ("-wal", "-shm"):
+                        old_aux = Path(str(target) + suffix)
+                        old_aux.unlink(missing_ok=True)
+
                     tmp_path = target.parent / f".{target.name}.snap_restore"
                     shutil.copy2(obj_path, tmp_path)
                     # Replace the live DB
