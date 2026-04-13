@@ -59,26 +59,31 @@ class Memory:
         self._cpp = None
         self._python = None
         self._mssql = None
-        
+
         # MSSQL or SQLite?
         self._use_mssql = use_mssql and HAS_MSSQL
-        
+
+        # Initialize embedder first to get actual dimension
+        self._embedder = EmbeddingProvider(backend=embedding_backend)
+        test_vec = self._embedder.embed("__dim_test__")
+        self._dim = len(test_vec)
+
         # Try C++ backend first
         if use_cpp:
             try:
                 from cpp_bridge import NeuralMemoryCpp
                 self._cpp = NeuralMemoryCpp()
-                self._cpp.initialize(dim=384)
-                print(f"[neural] C++ backend loaded")
+                self._cpp.initialize(dim=self._dim)
+                print(f"[neural] C++ backend loaded (dim={self._dim})")
             except (FileNotFoundError, OSError, ImportError) as e:
                 print(f"[neural] C++ not available: {e}")
                 self._cpp = None
-        
+
         # Fallback to Python backend
         if self._cpp is None:
             self._python = NeuralMemory(db_path=self._db_path, embedding_backend=embedding_backend)
             print(f"[neural] Python backend: {self._python.embedder.backend.__class__.__name__}")
-        
+
         # MSSQL store (if requested)
         if self._use_mssql:
             try:
@@ -90,14 +95,10 @@ class Memory:
             except Exception as e:
                 print(f"[neural] MSSQL failed: {e}, using SQLite")
                 self._mssql = None
-        
+
         # Always use embed_provider for text->vector
         if self._python:
             self._embedder = self._python.embedder
-        else:
-            self._embedder = EmbeddingProvider(backend=embedding_backend)
-        
-        self._dim = self._embedder.dim
     
     def remember(self, text: str, label: str = "") -> int:
         """

@@ -16,9 +16,8 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +145,12 @@ class DreamMSSQLStore:
         self.conn = pyodbc.connect(self.conn_str, autocommit=True)
         self._ensure_schema()
 
+    @staticmethod
+    def _ts() -> str:
+        """Return current time as ISO 8601 string for DATETIME2 columns."""
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')
+
     @classmethod
     def from_config(cls, config: dict) -> 'DreamMSSQLStore':
         """Create from config dict (mssql section). Env vars override config."""
@@ -177,7 +182,7 @@ class DreamMSSQLStore:
         cursor.execute(
             "INSERT INTO dream_sessions (started_at, phase) "
             "OUTPUT INSERTED.id VALUES (?, ?)",
-            time.time(), phase
+            self._ts(), phase
         )
         row = cursor.fetchone()
         self.conn.commit()
@@ -196,7 +201,7 @@ class DreamMSSQLStore:
             "bridges_found = ?, "
             "insights_created = ? "
             "WHERE id = ?",
-            time.time(),
+            self._ts(),
             stats.get("processed", stats.get("explored", 0)),
             stats.get("strengthened", 0),
             stats.get("pruned", 0),
@@ -269,34 +274,6 @@ class DreamMSSQLStore:
         )
         self.conn.commit()
 
-    def batch_strengthen_connections(self, edges: List[Tuple[int, int]],
-                                      delta: float = 0.05) -> int:
-        """Bulk strengthen connections. Returns count updated."""
-        if not edges:
-            return 0
-        cursor = self.conn.cursor()
-        cursor.executemany(
-            "UPDATE connections SET weight = CASE "
-            "WHEN weight + ? > 1.0 THEN 1.0 ELSE weight + ? END "
-            "WHERE source_id = ? AND target_id = ?",
-            [(delta, delta, src, tgt) for src, tgt in edges]
-        )
-        self.conn.commit()
-        return len(edges)
-
-    def batch_weaken_connections(self, threshold: float = 0.05,
-                                  delta: float = 0.01) -> int:
-        """Bulk weaken all connections above threshold in one UPDATE."""
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "UPDATE connections SET weight = CASE "
-            "WHEN weight - ? < 0.0 THEN 0.0 ELSE weight - ? END "
-            "WHERE weight > ?",
-            delta, delta, threshold
-        )
-        self.conn.commit()
-        return cursor.rowcount
-
     def add_bridge(self, source_id: int, target_id: int,
                     weight: float = 0.3) -> None:
         """Add a new bridge connection."""
@@ -336,7 +313,7 @@ class DreamMSSQLStore:
             "INSERT INTO connection_history "
             "(source_id, target_id, old_weight, new_weight, reason, changed_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            source_id, target_id, old_weight, new_weight, reason, time.time()
+            source_id, target_id, old_weight, new_weight, reason, self._ts()
         )
         self.conn.commit()
 
@@ -352,7 +329,7 @@ class DreamMSSQLStore:
             "confidence, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             session_id, insight_type, source_memory_id,
-            content, confidence, time.time()
+            content, confidence, self._ts()
         )
         self.conn.commit()
 

@@ -21,7 +21,7 @@ import sqlite3
 import threading
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -100,20 +100,6 @@ class DreamBackend:
 
     def weaken_connection(self, source_id: int, target_id: int,
                            delta: float = 0.01) -> None:
-        raise NotImplementedError
-
-    def batch_strengthen_connections(self, edges: List[Tuple[int, int]],
-                                      delta: float = 0.05) -> int:
-        """Bulk strengthen. Returns count updated."""
-        count = 0
-        for src, tgt in edges:
-            self.strengthen_connection(src, tgt, delta)
-            count += 1
-        return count
-
-    def batch_weaken_connections(self, threshold: float = 0.05,
-                                  delta: float = 0.01) -> int:
-        """Bulk weaken all connections above threshold. Returns count updated."""
         raise NotImplementedError
 
     def add_bridge(self, source_id: int, target_id: int,
@@ -266,38 +252,6 @@ class SQLiteDreamBackend(DreamBackend):
                 (delta, source_id, target_id)
             )
             conn.commit()
-        finally:
-            conn.close()
-
-    def batch_strengthen_connections(self, edges: List[Tuple[int, int]],
-                                      delta: float = 0.05) -> int:
-        """Bulk strengthen via executemany. Returns count updated."""
-        if not edges:
-            return 0
-        conn = self._connect()
-        try:
-            conn.executemany(
-                "UPDATE connections SET weight = MIN(weight + ?, 1.0) "
-                "WHERE source_id = ? AND target_id = ?",
-                [(delta, src, tgt) for src, tgt in edges]
-            )
-            conn.commit()
-            return len(edges)
-        finally:
-            conn.close()
-
-    def batch_weaken_connections(self, threshold: float = 0.05,
-                                  delta: float = 0.01) -> int:
-        """Bulk weaken all connections above threshold in one UPDATE."""
-        conn = self._connect()
-        try:
-            cursor = conn.execute(
-                "UPDATE connections SET weight = MAX(weight - ?, 0.0) "
-                "WHERE weight > ?",
-                (delta, threshold)
-            )
-            conn.commit()
-            return cursor.rowcount
         finally:
             conn.close()
 
@@ -550,9 +504,9 @@ class DreamEngine:
 
         For each recent memory:
           1. Fire spreading activation
-          2. Activated edges: batch strengthen
-          3. Non-activated edges: bulk weaken (single SQL UPDATE)
-          4. Edges below threshold: prune
+          2. Activated edges: weight += 0.05
+          3. Non-activated edges: weight -= 0.01
+          4. Edges below 0.05: prune
         """
         stats = {"processed": 0, "strengthened": 0, "weakened": 0, "pruned": 0}
         session_id = self._backend.start_session("nrem")
@@ -562,7 +516,7 @@ class DreamEngine:
             if not memories:
                 return stats
 
-            activated_edges: Set[Tuple[int, int]] = set()
+            activated_edges = set()
 
             for mem in memories:
                 mid = mem["id"]
@@ -577,17 +531,29 @@ class DreamEngine:
                         pass
                 stats["processed"] += 1
 
-            # Batch strengthen activated edges (usually small set)
-            if activated_edges:
-                stats["strengthened"] = self._backend.batch_strengthen_connections(
-                    list(activated_edges), 0.05
-                )
+            # Get all connections and update weights
+            all_conns = self._backend.get_connections()
+            now = time.time()
 
-            # Bulk weaken ALL non-activated connections above threshold
-            # Single SQL UPDATE instead of per-row loop
-            stats["weakened"] = self._backend.batch_weaken_connections(
-                threshold=0.05, delta=0.01
-            )
+            for conn in all_conns:
+                src, tgt = conn["source_id"], conn["target_id"]
+                key = (min(src, tgt), max(src, tgt))
+
+                if key in activated_edges:
+                    old_w = conn["weight"]
+                    self._backend.strengthen_connection(src, tgt, 0.05)
+                    self._backend.log_connection_change(
+                        src, tgt, old_w, min(old_w + 0.05, 1.0), "nrem_strengthen"
+                    )
+                    stats["strengthened"] += 1
+                else:
+                    old_w = conn["weight"]
+                    if old_w > 0.05:
+                        self._backend.weaken_connection(src, tgt, 0.01)
+                        self._backend.log_connection_change(
+                            src, tgt, old_w, max(old_w - 0.01, 0.0), "nrem_weaken"
+                        )
+                        stats["weakened"] += 1
 
             # Prune dead connections
             stats["pruned"] = self._backend.prune_weak(0.05)

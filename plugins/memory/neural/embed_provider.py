@@ -75,7 +75,9 @@ class SentenceTransformerBackend:
                 device=device,
                 local_files_only=is_cached
             )
-            self.dim = 384
+            # Detect actual embedding dimension from the model
+            test_vec = self.model.encode("_dim_probe_", normalize_embeddings=True)
+            self.dim = len(test_vec)
             SentenceTransformerBackend._shared_model = self.model
             SentenceTransformerBackend._shared_dim = self.dim
             
@@ -362,15 +364,29 @@ class EmbeddingProvider:
     def embed(self, text: str) -> list[float]:
         key = hashlib.md5(text.encode()).hexdigest()
         if key in self.cache:
-            return self.cache[key]
-        
+            cached = self.cache[key]
+            # Validate cached dimension matches backend
+            if len(cached) == self.dim:
+                return cached
+            # Dimension mismatch — recompute
+
         vec = self.backend.embed(text)
-        self.cache[key] = vec
         
+        # Validate dimension
+        if len(vec) != self.dim:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Embedding dimension mismatch: backend returned %d, expected %d",
+                len(vec), self.dim
+            )
+            self.dim = len(vec)
+
+        self.cache[key] = vec
+
         # Save periodically
         if len(self.cache) % 100 == 0:
             self._save_cache()
-        
+
         return vec
     
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
