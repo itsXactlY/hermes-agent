@@ -5,7 +5,6 @@ Pure display functions with no HermesCLI state dependency.
 
 import json
 import logging
-import os
 import shutil
 import subprocess
 import threading
@@ -354,7 +353,7 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
             disabled_tools.update(tools_in_ts)
 
     layout_table = Table.grid(padding=(0, 2))
-    layout_table.add_column("left", justify="center")
+    layout_table.add_column("left", justify="left")
     layout_table.add_column("right", justify="left")
 
     # Resolve skin colors once for the entire banner

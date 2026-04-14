@@ -28,7 +28,6 @@ Usage in run_agent.py:
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
@@ -206,6 +205,19 @@ class MemoryManager:
                     "Memory provider '%s' sync_turn failed: %s",
                     provider.name, e,
                 )
+
+    def absorb_message(self, role: str, content: str) -> None:
+        """Sponge-mode: immediately queue message for background absorption.
+
+        Non-blocking. Call for every message as it arrives.
+        """
+        for provider in self._providers:
+            try:
+                absorb_fn = getattr(provider, "absorb_message", None)
+                if absorb_fn:
+                    absorb_fn(role, content)
+            except Exception:
+                pass
 
     # -- Tools ---------------------------------------------------------------
 
