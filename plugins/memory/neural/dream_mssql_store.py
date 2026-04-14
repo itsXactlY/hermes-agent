@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -177,7 +178,7 @@ class DreamMSSQLStore:
         cursor.execute(
             "INSERT INTO dream_sessions (started_at, phase) "
             "OUTPUT INSERTED.id VALUES (?, ?)",
-            time.time(), phase
+            datetime.fromtimestamp(time.time()), phase
         )
         row = cursor.fetchone()
         self.conn.commit()
@@ -196,7 +197,7 @@ class DreamMSSQLStore:
             "bridges_found = ?, "
             "insights_created = ? "
             "WHERE id = ?",
-            time.time(),
+            datetime.fromtimestamp(time.time()),
             stats.get("processed", stats.get("explored", 0)),
             stats.get("strengthened", 0),
             stats.get("pruned", 0),
@@ -336,7 +337,7 @@ class DreamMSSQLStore:
             "INSERT INTO connection_history "
             "(source_id, target_id, old_weight, new_weight, reason, changed_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            source_id, target_id, old_weight, new_weight, reason, time.time()
+            source_id, target_id, old_weight, new_weight, reason, datetime.fromtimestamp(time.time())
         )
         self.conn.commit()
 
@@ -352,7 +353,7 @@ class DreamMSSQLStore:
             "confidence, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             session_id, insight_type, source_memory_id,
-            content, confidence, time.time()
+            content, confidence, datetime.fromtimestamp(time.time())
         )
         self.conn.commit()
 
