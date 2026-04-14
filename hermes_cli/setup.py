@@ -1264,7 +1264,22 @@ def setup_terminal_backend(config: dict):
         current_image = config.get("terminal", {}).get(
             "singularity_image", "docker://nikolaik/python-nodejs:python3.11-nodejs20"
         )
-        image = prompt("  Container image", current_image)
+        while True:
+            image = prompt("  Container image", current_image)
+            if not image:
+                break
+            raw_image = image
+            for prefix in ("docker://", "oci://", "docker-archive://"):
+                if raw_image.startswith(prefix):
+                    raw_image = raw_image[len(prefix):]
+                    break
+            if _validate_container_image(raw_image):
+                break
+            print_warning(f"Unrecognized registry in image: {raw_image}")
+            print_info("  Trusted registries: docker.io, ghcr.io, gcr.io")
+            if not prompt_yes_no("  Use this image anyway?", False):
+                continue
+            break
         config["terminal"]["singularity_image"] = image
         save_env_value("TERMINAL_SINGULARITY_IMAGE", image)
 
