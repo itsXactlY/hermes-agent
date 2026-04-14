@@ -666,8 +666,6 @@ def _prompt_container_resources(config: dict):
 # Section 1: Model & Provider Configuration
 # =============================================================================
 
-
-
 def setup_model_provider(config: dict, *, quick: bool = False):
     """Configure the inference provider and default model.
 
