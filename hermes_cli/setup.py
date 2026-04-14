@@ -1329,36 +1329,15 @@ def setup_terminal_backend(config: dict):
             print_info("Requires a Modal account: https://modal.com")
 
             # Check if modal SDK is installed
-            try:
-                __import__("modal")
-            except ImportError:
-                print_info("Installing modal SDK...")
-                import subprocess
-
-                uv_bin = shutil.which("uv")
-                if uv_bin:
-                    result = subprocess.run(
-                        [
-                            uv_bin,
-                            "pip",
-                            "install",
-                            "--python",
-                            sys.executable,
-                            "modal",
-                        ],
-                        capture_output=True,
-                        text=True,
-                    )
-                else:
-                    result = subprocess.run(
-                        [sys.executable, "-m", "pip", "install", "modal"],
-                        capture_output=True,
-                        text=True,
-                    )
-                if result.returncode == 0:
+            if importlib.util.find_spec("modal") is None:
+                print_info("Installing modal SDK (pinned >=1.4.0,<2.0)...")
+                ok, err = _install_package("modal")
+                if ok:
                     print_success("modal SDK installed")
                 else:
-                    print_warning("Install failed — run manually: pip install modal")
+                    print_warning(f"Install failed — run manually: pip install 'modal>=1.4.0,<2.0'")
+                    if err:
+                        print_info(f"  Error: {err}")
 
             # Modal token
             print()
@@ -1391,31 +1370,15 @@ def setup_terminal_backend(config: dict):
         print_info("Sign up at: https://daytona.io")
 
         # Check if daytona SDK is installed
-        try:
-            __import__("daytona")
-        except ImportError:
-            print_info("Installing daytona SDK...")
-            import subprocess
-
-            uv_bin = shutil.which("uv")
-            if uv_bin:
-                result = subprocess.run(
-                    [uv_bin, "pip", "install", "--python", sys.executable, "daytona"],
-                    capture_output=True,
-                    text=True,
-                )
-            else:
-                result = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "daytona"],
-                    capture_output=True,
-                    text=True,
-                )
-            if result.returncode == 0:
+        if importlib.util.find_spec("daytona") is None:
+            print_info("Installing daytona SDK (pinned >=0.160.0,<1.0)...")
+            ok, err = _install_package("daytona")
+            if ok:
                 print_success("daytona SDK installed")
             else:
-                print_warning("Install failed — run manually: pip install daytona")
-                if result.stderr:
-                    print_info(f"  Error: {result.stderr.strip().splitlines()[-1]}")
+                print_warning(f"Install failed — run manually: pip install 'daytona>=0.160.0,<1.0'")
+                if err:
+                    print_info(f"  Error: {err}")
 
         # Daytona API key
         print()
@@ -1437,7 +1400,17 @@ def setup_terminal_backend(config: dict):
         current_image = config.get("terminal", {}).get(
             "daytona_image", "nikolaik/python-nodejs:python3.11-nodejs20"
         )
-        image = prompt("  Sandbox image", current_image)
+        while True:
+            image = prompt("  Sandbox image", current_image)
+            if not image:
+                break
+            if _validate_container_image(image):
+                break
+            print_warning(f"Unrecognized registry in image: {image}")
+            print_info("  Trusted registries: docker.io, ghcr.io, gcr.io")
+            if not prompt_yes_no("  Use this image anyway?", False):
+                continue
+            break
         config["terminal"]["daytona_image"] = image
         save_env_value("TERMINAL_DAYTONA_IMAGE", image)
 
@@ -1470,6 +1443,16 @@ def setup_terminal_backend(config: dict):
         default_key = str(Path.home() / ".ssh" / "id_rsa")
         ssh_key = prompt("  SSH private key path", current_key or default_key)
         if ssh_key:
+            # Sanitize: expand user, resolve symlinks, verify file exists
+            ssh_key = str(Path(ssh_key).expanduser().resolve())
+            if not Path(ssh_key).is_file():
+                print_warning(f"SSH key file not found: {ssh_key}")
+                print_info("  You can still configure it now and fix the path later.")
+            elif not Path(ssh_key).stat().st_mode & 0o77 == 0:
+                print_warning(
+                    f"SSH key is world-readable: {ssh_key}"
+                )
+                print_info(f"  Run: chmod 600 {ssh_key}")
             save_env_value("TERMINAL_SSH_KEY", ssh_key)
 
         # Test connection
@@ -1926,28 +1909,21 @@ def _setup_matrix():
             print_success("E2EE enabled")
 
         matrix_pkg = "mautrix[encryption]" if want_e2ee else "mautrix"
-        try:
-            __import__("mautrix")
-        except ImportError:
-            print_info(f"Installing {matrix_pkg}...")
-            import subprocess
+        if importlib.util.find_spec("mautrix") is None:
+            print_info(f"Installing {matrix_pkg} (pinned >=0.21.0,<1.0)...")
+            constraint = f"{matrix_pkg}>=0.21.0,<1.0"
             uv_bin = shutil.which("uv")
             if uv_bin:
-                result = subprocess.run(
-                    [uv_bin, "pip", "install", "--python", sys.executable, matrix_pkg],
-                    capture_output=True, text=True,
-                )
+                cmd = [uv_bin, "pip", "install", "--python", sys.executable, constraint]
             else:
-                result = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", matrix_pkg],
-                    capture_output=True, text=True,
-                )
-            if result.returncode == 0:
+                cmd = [sys.executable, "-m", "pip", "install", constraint, "--quiet"]
+            ok, err = _run_install_cmd(cmd)
+            if ok:
                 print_success(f"{matrix_pkg} installed")
             else:
-                print_warning(f"Install failed — run manually: pip install '{matrix_pkg}'")
-                if result.stderr:
-                    print_info(f"  Error: {result.stderr.strip().splitlines()[-1]}")
+                print_warning(f"Install failed — run manually: pip install '{constraint}'")
+                if err:
+                    print_info(f"  Error: {err}")
 
         print()
         print_info("🔒 Security: Restrict who can use your bot")
