@@ -43,14 +43,6 @@ def _model_config_dict(config: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
-def _set_default_model(config: Dict[str, Any], model_name: str) -> None:
-    if not model_name:
-        return
-    model_cfg = _model_config_dict(config)
-    model_cfg["default"] = model_name
-    config["model"] = model_cfg
-
-
 def _get_credential_pool_strategies(config: Dict[str, Any]) -> Dict[str, str]:
     strategies = config.get("credential_pool_strategies")
     return dict(strategies) if isinstance(strategies, dict) else {}
@@ -136,43 +128,6 @@ def _set_reasoning_effort(config: Dict[str, Any], effort: str) -> None:
         config["agent"] = agent_cfg
     agent_cfg["reasoning_effort"] = effort
 
-
-def _setup_copilot_reasoning_selection(
-    config: Dict[str, Any],
-    model_id: str,
-    prompt_choice,
-    *,
-    catalog: Optional[list[dict[str, Any]]] = None,
-    api_key: str = "",
-) -> None:
-    from hermes_cli.models import github_model_reasoning_efforts, normalize_copilot_model_id
-
-    normalized_model = normalize_copilot_model_id(
-        model_id,
-        catalog=catalog,
-        api_key=api_key,
-    ) or model_id
-    efforts = github_model_reasoning_efforts(normalized_model, catalog=catalog, api_key=api_key)
-    if not efforts:
-        return
-
-    current_effort = _current_reasoning_effort(config)
-    choices = list(efforts) + ["Disable reasoning", f"Keep current ({current_effort or 'default'})"]
-
-    if current_effort == "none":
-        default_idx = len(efforts)
-    elif current_effort in efforts:
-        default_idx = efforts.index(current_effort)
-    elif "medium" in efforts:
-        default_idx = efforts.index("medium")
-    else:
-        default_idx = len(choices) - 1
-
-    effort_idx = prompt_choice("Select reasoning effort:", choices, default_idx)
-    if effort_idx < len(efforts):
-        _set_reasoning_effort(config, efforts[effort_idx])
-    elif effort_idx == len(efforts):
-        _set_reasoning_effort(config, "none")
 
 
 
@@ -666,6 +621,8 @@ def _prompt_container_resources(config: dict):
 # Section 1: Model & Provider Configuration
 # =============================================================================
 
+
+
 def setup_model_provider(config: dict, *, quick: bool = False):
     """Configure the inference provider and default model.
 
@@ -903,6 +860,93 @@ def _check_espeak_ng() -> bool:
     return shutil.which("espeak-ng") is not None or shutil.which("espeak") is not None
 
 
+# Trusted container image registries — used to validate user-supplied image names.
+_TRUSTED_IMAGE_REGISTRIES = (
+    "docker.io",
+    "ghcr.io",
+    "gcr.io",
+    "registry.hub.docker.com",
+    "nikolaik/",
+    "python:",
+    "node:",
+)
+
+# Pinned package versions for supply-chain hardening.
+_PINNED_PACKAGES = {
+    "neutts": {"constraint": "neutts[all]>=1.2.0,<2.0"},
+    "modal": {"constraint": "modal>=1.4.0,<2.0"},
+    "daytona": {"constraint": "daytona>=0.160.0,<1.0"},
+    "mautrix": {"constraint": "mautrix>=0.21.0,<1.0"},
+}
+
+
+def _pip_install_cmd(package_key: str) -> list[str]:
+    """Return a hardened pip install command list for a known package key."""
+    spec = _PINNED_PACKAGES.get(package_key)
+    if spec:
+        return [sys.executable, "-m", "pip", "install", spec["constraint"], "--quiet"]
+    return [sys.executable, "-m", "pip", "install", package_key, "--quiet"]
+
+
+def _uv_pip_install_cmd(package_key: str, python_exe: str) -> list[str]:
+    """Return a hardened uv pip install command list for a known package key."""
+    spec = _PINNED_PACKAGES.get(package_key)
+    constraint = spec["constraint"] if spec else package_key
+    return [shutil.which("uv"), "pip", "install", "--python", python_exe, constraint]
+
+
+def _run_install_cmd(cmd: list[str]) -> tuple[bool, str]:
+    """Run a pip/uv install command and return (success, stderr_summary)."""
+    import subprocess
+    if not cmd or not cmd[0]:
+        return False, "no executable found"
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return False, "installation timed out"
+    if result.returncode == 0:
+        return True, ""
+    stderr_lines = result.stderr.strip().splitlines()
+    return False, stderr_lines[-1] if stderr_lines else "unknown error"
+
+
+def _install_package(package_key: str) -> tuple[bool, str]:
+    """Install a package via uv (preferred) or pip fallback."""
+    import subprocess
+    uv_bin = shutil.which("uv")
+    if uv_bin:
+        cmd = _uv_pip_install_cmd(package_key, sys.executable)
+    else:
+        cmd = _pip_install_cmd(package_key)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return False, "Installation timed out"
+    if result.returncode == 0:
+        return True, ""
+    stderr_lines = result.stderr.strip().splitlines()
+    return False, stderr_lines[-1] if stderr_lines else "unknown error"
+
+
+def _validate_container_image(image: str) -> bool:
+    """Return True if image looks like it comes from a trusted registry."""
+    if not image:
+        return False
+    if "/" not in image and ":" in image:
+        return True
+    if image.startswith("docker.io") or image.startswith("library/"):
+        return True
+    for prefix in ("ghcr.io/", "gcr.io/"):
+        if image.startswith(prefix):
+            return True
+    for prefix in _TRUSTED_IMAGE_REGISTRIES:
+        if prefix.endswith("/") and image.startswith(prefix):
+            return True
+        if not prefix.endswith("/") and image.startswith(prefix):
+            return True
+    return False
+
+
 def _install_neutts_deps() -> bool:
     """Install NeuTTS dependencies with user approval. Returns True on success."""
     import subprocess
@@ -934,7 +978,6 @@ def _install_neutts_deps() -> bool:
                 return False
         else:
             print_warning("espeak-ng is required for NeuTTS. Install it manually before using NeuTTS.")
-            return False
 
     # Install neutts Python package (hardened: version-pinned)
     print()
@@ -949,118 +992,6 @@ def _install_neutts_deps() -> bool:
         print_error(f"Failed to install neutts: {err}")
         print_info("Try manually: python -m pip install 'neutts[all]>=1.2.0,<2.0'")
         return False
-
-# Trusted container image registries — used to validate user-supplied image names.
-_TRUSTED_IMAGE_REGISTRIES = (
-    "docker.io",
-    "ghcr.io",
-    "gcr.io",
-    "registry.hub.docker.com",
-    "nikolaik/",          # shorthand for docker.io/nikolaik/...
-    "python:",            # shorthand for docker.io/library/python:...
-    "node:",              # shorthand for docker.io/library/node:...
-)
-
-# Pinned package versions with SHA-256 hashes for pip --require-hashes.
-# Regenerate with:  pip hash <wheel-or-sdist>  or  pip install --dry-run --report
-# The hashes below are for the primary sdist/wheel on PyPI as of 2026-04-14.
-_PINNED_PACKAGES = {
-    # neutts[all] — pinned to a concrete version range.
-    # The [all] extra pulls optional deps; we pin the base package.
-    "neutts": {
-        "constraint": "neutts[all]>=1.2.0,<2.0",
-    },
-    "modal": {
-        "constraint": "modal>=1.4.0,<2.0",
-    },
-    "daytona": {
-        "constraint": "daytona>=0.160.0,<1.0",
-    },
-    "mautrix": {
-        "constraint": "mautrix>=0.21.0,<1.0",
-    },
-}
-
-
-def _pip_install_cmd(package_key: str) -> list[str]:
-    """Return a hardened pip install command list for a known package key."""
-    spec = _PINNED_PACKAGES.get(package_key)
-    if spec:
-        return [sys.executable, "-m", "pip", "install", spec["constraint"], "--quiet"]
-    # Fallback — should never happen if callers use the right key
-    return [sys.executable, "-m", "pip", "install", package_key, "--quiet"]
-
-
-def _uv_pip_install_cmd(package_key: str, python_exe: str) -> list[str]:
-    """Return a hardened uv pip install command list for a known package key."""
-    spec = _PINNED_PACKAGES.get(package_key)
-    constraint = spec["constraint"] if spec else package_key
-    return [shutil.which("uv"), "pip", "install", "--python", python_exe, constraint]
-
-
-def _run_install_cmd(cmd: list[str]) -> tuple[bool, str]:
-    """Run a pip/uv install command and return (success, stderr_summary)."""
-    import subprocess
-
-    if not cmd or not cmd[0]:
-        return False, "no executable found"
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    except subprocess.TimeoutExpired:
-        return False, "installation timed out"
-
-    if result.returncode == 0:
-        return True, ""
-    stderr_lines = result.stderr.strip().splitlines()
-    summary = stderr_lines[-1] if stderr_lines else "unknown error"
-    return False, summary
-
-
-def _install_package(package_key: str) -> tuple[bool, str]:
-    """Install a package via uv (preferred) or pip fallback.
-
-    Returns (success, stderr_summary).
-    """
-    import subprocess
-
-    uv_bin = shutil.which("uv")
-    if uv_bin:
-        cmd = _uv_pip_install_cmd(package_key, sys.executable)
-    else:
-        cmd = _pip_install_cmd(package_key)
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    except subprocess.TimeoutExpired:
-        return False, "Installation timed out"
-
-    if result.returncode == 0:
-        return True, ""
-    stderr_lines = result.stderr.strip().splitlines()
-    summary = stderr_lines[-1] if stderr_lines else "unknown error"
-    return False, summary
-
-
-def _validate_container_image(image: str) -> bool:
-    """Return True if *image* looks like it comes from a trusted registry."""
-    if not image:
-        return False
-    # Accept bare image names (implicit docker.io/library/)
-    if "/" not in image and ":" in image:
-        return True  # e.g. "python:3.11"
-    if image.startswith("docker.io") or image.startswith("library/"):
-        return True
-    for prefix in ("ghcr.io/", "gcr.io/"):
-        if image.startswith(prefix):
-            return True
-    # Shorthand prefixes
-    for prefix in _TRUSTED_IMAGE_REGISTRIES:
-        if prefix.endswith("/") and image.startswith(prefix):
-            return True
-        if not prefix.endswith("/") and image.startswith(prefix):
-            return True
-    return False
 
 
 def _setup_tts_provider(config: dict):
@@ -1337,7 +1268,6 @@ def setup_terminal_backend(config: dict):
             image = prompt("  Container image", current_image)
             if not image:
                 break
-            # Strip docker:// or oci:// prefix for validation
             raw_image = image
             for prefix in ("docker://", "oci://", "docker-archive://"):
                 if raw_image.startswith(prefix):
@@ -1519,7 +1449,6 @@ def setup_terminal_backend(config: dict):
                 print_warning(f"SSH key file not found: {ssh_key}")
                 print_info("  You can still configure it now and fix the path later.")
             elif not Path(ssh_key).stat().st_mode & 0o77 == 0:
-                # Warn if key is world-readable (permissions should be 600 or stricter)
                 print_warning(
                     f"SSH key is world-readable: {ssh_key}"
                 )
@@ -1900,7 +1829,7 @@ def _setup_slack():
     print_info("   3. Add Bot Token Scopes: Features → OAuth & Permissions")
     print_info("      Required scopes: chat:write, app_mentions:read,")
     print_info("      channels:history, channels:read, im:history,")
-    print_info("      im:read, im:write, users:read, files:write")
+    print_info("      im:read, im:write, users:read, files:read, files:write")
     print_info("      Optional for private channels: groups:history")
     print_info("   4. Subscribe to Events: Features → Event Subscriptions → Enable")
     print_info("      Required events: message.im, message.channels, app_mention")
@@ -1982,7 +1911,6 @@ def _setup_matrix():
         matrix_pkg = "mautrix[encryption]" if want_e2ee else "mautrix"
         if importlib.util.find_spec("mautrix") is None:
             print_info(f"Installing {matrix_pkg} (pinned >=0.21.0,<1.0)...")
-            # Use the base mautrix constraint; [encryption] extras are handled by the constraint
             constraint = f"{matrix_pkg}>=0.21.0,<1.0"
             uv_bin = shutil.which("uv")
             if uv_bin:
@@ -2126,6 +2054,54 @@ def _setup_wecom_callback():
     _gw_setup()
 
 
+def _setup_qqbot():
+    """Configure QQ Bot gateway."""
+    print_header("QQ Bot")
+    existing = get_env_value("QQ_APP_ID")
+    if existing:
+        print_info("QQ Bot: already configured")
+        if not prompt_yes_no("Reconfigure QQ Bot?", False):
+            return
+
+    print_info("Connects Hermes to QQ via the Official QQ Bot API (v2).")
+    print_info("   Requires a QQ Bot application at q.qq.com")
+    print_info("   Reference: https://bot.q.qq.com/wiki/develop/api-v2/")
+    print()
+
+    app_id = prompt("QQ Bot App ID")
+    if not app_id:
+        print_warning("App ID is required — skipping QQ Bot setup")
+        return
+    save_env_value("QQ_APP_ID", app_id.strip())
+
+    client_secret = prompt("QQ Bot App Secret", password=True)
+    if not client_secret:
+        print_warning("App Secret is required — skipping QQ Bot setup")
+        return
+    save_env_value("QQ_CLIENT_SECRET", client_secret)
+    print_success("QQ Bot credentials saved")
+
+    print()
+    print_info("🔒 Security: Restrict who can DM your bot")
+    print_info("   Use QQ user OpenIDs (found in event payloads)")
+    print()
+    allowed_users = prompt("Allowed user OpenIDs (comma-separated, leave empty for open access)")
+    if allowed_users:
+        save_env_value("QQ_ALLOWED_USERS", allowed_users.replace(" ", ""))
+        print_success("QQ Bot allowlist configured")
+    else:
+        print_info("⚠️  No allowlist set — anyone can DM the bot!")
+
+    print()
+    print_info("📬 Home Channel: OpenID for cron job delivery and notifications.")
+    home_channel = prompt("Home channel OpenID (leave empty to set later)")
+    if home_channel:
+        save_env_value("QQ_HOME_CHANNEL", home_channel)
+
+    print()
+    print_success("QQ Bot configured!")
+
+
 def _setup_bluebubbles():
     """Configure BlueBubbles iMessage gateway."""
     print_header("BlueBubbles (iMessage)")
@@ -2191,6 +2167,15 @@ def _setup_bluebubbles():
     print_info("   Install: https://docs.bluebubbles.app/helper-bundle/installation")
 
 
+def _setup_qqbot():
+    """Configure QQ Bot (Official API v2) via standard platform setup."""
+    from hermes_cli.gateway import _PLATFORMS
+    qq_platform = next((p for p in _PLATFORMS if p["key"] == "qqbot"), None)
+    if qq_platform:
+        from hermes_cli.gateway import _setup_standard_platform
+        _setup_standard_platform(qq_platform)
+
+
 def _setup_webhooks():
     """Configure webhook integration."""
     print_header("Webhooks")
@@ -2254,6 +2239,7 @@ _GATEWAY_PLATFORMS = [
     ("WeCom Callback (Self-Built App)", "WECOM_CALLBACK_CORP_ID", _setup_wecom_callback),
     ("Weixin (WeChat)", "WEIXIN_ACCOUNT_ID", _setup_weixin),
     ("BlueBubbles (iMessage)", "BLUEBUBBLES_SERVER_URL", _setup_bluebubbles),
+    ("QQ Bot", "QQ_APP_ID", _setup_qqbot),
     ("Webhooks (GitHub, GitLab, etc.)", "WEBHOOK_ENABLED", _setup_webhooks),
 ]
 
@@ -2305,6 +2291,7 @@ def setup_gateway(config: dict):
         or get_env_value("WECOM_BOT_ID")
         or get_env_value("WEIXIN_ACCOUNT_ID")
         or get_env_value("BLUEBUBBLES_SERVER_URL")
+        or get_env_value("QQ_APP_ID")
         or get_env_value("WEBHOOK_ENABLED")
     )
     if any_messaging:
@@ -2326,6 +2313,8 @@ def setup_gateway(config: dict):
             missing_home.append("Slack")
         if get_env_value("BLUEBUBBLES_SERVER_URL") and not get_env_value("BLUEBUBBLES_HOME_CHANNEL"):
             missing_home.append("BlueBubbles")
+        if get_env_value("QQ_APP_ID") and not get_env_value("QQ_HOME_CHANNEL"):
+            missing_home.append("QQBot")
 
         if missing_home:
             print()
@@ -2347,6 +2336,7 @@ def setup_gateway(config: dict):
         from hermes_cli.gateway import (
             _is_service_installed,
             _is_service_running,
+            supports_systemd_services,
             has_conflicting_systemd_units,
             install_linux_gateway_from_setup,
             print_systemd_scope_conflict_warning,
@@ -2359,16 +2349,18 @@ def setup_gateway(config: dict):
 
         service_installed = _is_service_installed()
         service_running = _is_service_running()
+        supports_systemd = supports_systemd_services()
+        supports_service_manager = supports_systemd or _is_macos
 
         print()
-        if _is_linux and has_conflicting_systemd_units():
+        if supports_systemd and has_conflicting_systemd_units():
             print_systemd_scope_conflict_warning()
             print()
 
         if service_running:
             if prompt_yes_no("  Restart the gateway to pick up changes?", True):
                 try:
-                    if _is_linux:
+                    if supports_systemd:
                         systemd_restart()
                     elif _is_macos:
                         launchd_restart()
@@ -2377,14 +2369,14 @@ def setup_gateway(config: dict):
         elif service_installed:
             if prompt_yes_no("  Start the gateway service?", True):
                 try:
-                    if _is_linux:
+                    if supports_systemd:
                         systemd_start()
                     elif _is_macos:
                         launchd_start()
                 except Exception as e:
                     print_error(f"  Start failed: {e}")
-        elif _is_linux or _is_macos:
-            svc_name = "systemd" if _is_linux else "launchd"
+        elif supports_service_manager:
+            svc_name = "systemd" if supports_systemd else "launchd"
             if prompt_yes_no(
                 f"  Install the gateway as a {svc_name} service? (runs in background, starts on boot)",
                 True,
@@ -2392,7 +2384,7 @@ def setup_gateway(config: dict):
                 try:
                     installed_scope = None
                     did_install = False
-                    if _is_linux:
+                    if supports_systemd:
                         installed_scope, did_install = install_linux_gateway_from_setup(force=False)
                     else:
                         launchd_install(force=False)
@@ -2400,7 +2392,7 @@ def setup_gateway(config: dict):
                     print()
                     if did_install and prompt_yes_no("  Start the service now?", True):
                         try:
-                            if _is_linux:
+                            if supports_systemd:
                                 systemd_start(system=installed_scope == "system")
                             elif _is_macos:
                                 launchd_start()
@@ -2411,12 +2403,21 @@ def setup_gateway(config: dict):
                     print_info("  You can try manually: hermes gateway install")
             else:
                 print_info("  You can install later: hermes gateway install")
-                if _is_linux:
+                if supports_systemd:
                     print_info("  Or as a boot-time service: sudo hermes gateway install --system")
                 print_info("  Or run in foreground:  hermes gateway")
         else:
-            print_info("Start the gateway to bring your bots online:")
-            print_info("   hermes gateway              # Run in foreground")
+            from hermes_constants import is_container
+            if is_container():
+                print_info("Start the gateway to bring your bots online:")
+                print_info("   hermes gateway run          # Run as container main process")
+                print_info("")
+                print_info("For automatic restarts, use a Docker restart policy:")
+                print_info("   docker run --restart unless-stopped ...")
+                print_info("   docker restart <container>  # Manual restart")
+            else:
+                print_info("Start the gateway to bring your bots online:")
+                print_info("   hermes gateway              # Run in foreground")
 
         print_info("━" * 50)
 
