@@ -202,6 +202,40 @@ TOOLSETS = {
     },
 
 
+    # hermelinChat artifact panel toolsets (installed by hermelinChat patch)
+    "artifacts": {
+        "description": "Create and manage artifacts in hermelinChat's right-side panel. Prefer artifacts over terminal output for large/rich content (tables, reports, logs, dashboards, code).",
+        "tools": [
+            "list_artifacts",
+            "focus_artifact",
+            "create_artifact",
+            "remove_artifact",
+            "clear_artifacts",
+            "start_runner",
+            "tail_runner_log",
+            "stop_runner",
+            "artifact_bridge_command",
+            "artifact_bridge_read_state"
+        ],
+        "includes": []
+    },
+    "strudel": {
+        "description": "Control a Strudel artifact in hermelinChat (code, cursor, play/stop)",
+        "tools": [
+            "strudel_get_code",
+            "strudel_set_code",
+            "strudel_load_file",
+            "strudel_append_code",
+            "strudel_replace_range",
+            "strudel_get_cursor",
+            "strudel_set_cursor",
+            "strudel_play",
+            "strudel_stop"
+        ],
+        "includes": []
+    },
+
+
     # Scenario-specific toolsets
     
     "debugging": {
