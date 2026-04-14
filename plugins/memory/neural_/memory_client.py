@@ -2,6 +2,12 @@
 """
 memory_client.py - Python client for Neural Memory Adapter
 Wraps the C++ library via ctypes. Uses embed_provider for text->vector.
+
+Architecture:
+  C++ SIMD bridge (optional) → fast retrieve/store
+  Cython fast_ops (optional) → fast cosine_similarity
+  SQLite or MSSQL → persistence
+  Python → orchestration (thin layer)
 """
 
 import ctypes
@@ -90,12 +96,12 @@ class SQLiteStore:
     def __init__(self, db_path: str | Path = DB_PATH):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        self.conn.execute("PRAGMA journal_mode=WAL")  # Better concurrent read perf
-        self.conn.execute("PRAGMA synchronous=NORMAL") # Faster writes
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
         self.conn.commit()
         self._lock = threading.Lock()
-    
+
     def store(self, label: str, content: str, embedding: list[float]) -> int:
         blob = struct.pack(f'{len(embedding)}f', *embedding)
         with self._lock:
@@ -105,7 +111,7 @@ class SQLiteStore:
             )
             self.conn.commit()
             return cur.lastrowid
-    
+
     def get_all(self) -> list[dict]:
         import struct
         with self._lock:
@@ -125,7 +131,7 @@ class SQLiteStore:
                 'access_count': access_count
             })
         return results
-    
+
     def get(self, id_: int) -> Optional[dict]:
         import struct
         row = self.conn.execute(
@@ -142,7 +148,7 @@ class SQLiteStore:
             'embedding': embedding, 'salience': salience,
             'access_count': access_count
         }
-    
+
     def touch(self, id_: int):
         with self._lock:
             self.conn.execute(
@@ -150,7 +156,7 @@ class SQLiteStore:
                 (id_,)
             )
             self.conn.commit()
-    
+
     def add_connection(self, source: int, target: int, weight: float, edge_type: str = "similar"):
         with self._lock:
             self.conn.execute(
@@ -158,10 +164,10 @@ class SQLiteStore:
                 (source, target, weight, edge_type)
             )
             self.conn.commit()
-    
+
     def get_connections(self, node_id: int) -> list[dict]:
         rows = self.conn.execute(
-            """SELECT source_id, target_id, weight, edge_type FROM connections 
+            """SELECT source_id, target_id, weight, edge_type FROM connections
                WHERE source_id = ? OR target_id = ? ORDER BY weight DESC""",
             (node_id, node_id)
         ).fetchall()
@@ -169,12 +175,12 @@ class SQLiteStore:
             {'source': r[0], 'target': r[1], 'weight': r[2], 'type': r[3]}
             for r in rows
         ]
-    
+
     def get_stats(self) -> dict:
         mem_count = self.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
         conn_count = self.conn.execute("SELECT COUNT(*) FROM connections").fetchone()[0]
         return {'memories': mem_count, 'connections': conn_count}
-    
+
     def close(self):
         self.conn.close()
 
@@ -186,19 +192,30 @@ class SQLiteStore:
 class NeuralMemory:
     """
     Python interface to the Neural Memory system.
-    
+
+    Architecture:
+      - C++ SIMD bridge (optional) for fast retrieve/store
+      - Cython fast_ops (optional) for fast cosine_similarity
+      - SQLite or MSSQL for persistence
+      - Python for orchestration
+
     Usage:
         mem = NeuralMemory()
         mem.remember("The user has a dog named Lou")
-        mem.remember("Working on BTQuant trading platform")
         results = mem.recall("What pet does the user have?")
     """
-    
+
     def __init__(self, db_path: str | Path = DB_PATH, embedding_backend: str = "auto",
-                 use_mssql: bool = False, use_cpp: bool = True):
+                 use_mssql: bool = False, use_cpp: bool = False):
         from embed_provider import EmbeddingProvider
 
         self.embedder = EmbeddingProvider(backend=embedding_backend)
+
+        # Validate embedding dimension with a test call
+        test_vec = self.embedder.embed("__dim_test__")
+        self.dim = len(test_vec)
+        if self.dim != self.embedder.dim:
+            self.embedder.dim = self.dim
 
         if use_mssql:
             from mssql_store import MSSQLStore
@@ -206,30 +223,36 @@ class NeuralMemory:
         else:
             self.store = SQLiteStore(db_path)
 
-        self.dim = self.embedder.dim
-
-        # C++ SIMD index for fast retrieval (primary search path)
-        self._cpp = None
-        if use_cpp:
-            try:
-                from cpp_bridge import NeuralMemoryCpp
-                self._cpp = NeuralMemoryCpp()
-                self._cpp.initialize(dim=self.dim)
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "C++ bridge unavailable, falling back to Python: %s", e
-                )
-                self._cpp = None
-
         # In-memory graph for spreading activation
         self._graph_nodes: dict[int, dict] = {}  # id -> {embedding, connections}
         self._load_from_store()
 
+        # C++ SIMD index for fast retrieve (optional, loaded AFTER graph)
+        self._cpp = None
+        self._cpp_id_map = {}  # cpp_id -> sqlite_id
+        if use_cpp:
+            try:
+                from cpp_bridge import NeuralMemoryCpp
+                self._cpp = NeuralMemoryCpp()
+                if not self._cpp.initialize(dim=self.dim):
+                    self._cpp = None
+                else:
+                    # Load existing memories into C++ index
+                    for mem in self.store.get_all():
+                        emb = mem.get('embedding', [])
+                        if emb and len(emb) == self.dim:
+                            cpp_id = self._cpp.store(emb, mem.get('label', ''), mem.get('content', ''))
+                            self._cpp_id_map[cpp_id] = mem['id']
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).debug(
+                    "C++ bridge unavailable, using Python fallback: %s", e
+                )
+                self._cpp = None
+
     def _load_from_store(self):
-        """Load existing memories into in-memory graph + C++ index."""
-        all_mems = self.store.get_all()
-        for mem in all_mems:
+        """Load existing memories into in-memory graph"""
+        for mem in self.store.get_all():
             self._graph_nodes[mem['id']] = {
                 'embedding': mem['embedding'],
                 'label': mem['label'],
@@ -237,42 +260,30 @@ class NeuralMemory:
             }
 
         # Load connections
-        for mem in all_mems:
+        for mem in self.store.get_all():
             conns = self.store.get_connections(mem['id'])
             for c in conns:
                 other = c['target'] if c['source'] == mem['id'] else c['source']
                 self._graph_nodes[mem['id']]['connections'][other] = c['weight']
 
-        # Load into C++ SIMD index + build ID mapping
-        self._cpp_id_map = {}  # cpp_id -> sqlite_id
-        if self._cpp:
-            for mem in all_mems:
-                emb = mem.get('embedding', [])
-                if emb and len(emb) == self.dim:
-                    cpp_id = self._cpp.store(emb, mem.get('label', ''), mem.get('content', ''))
-                    self._cpp_id_map[cpp_id] = mem['id']
-    
-    def remember(self, text: str, label: str = "", detect_conflicts: bool = True,
-                 auto_connect: bool = True) -> int:
+    def remember(self, text: str, label: str = "", detect_conflicts: bool = True) -> int:
         """Store a memory. Returns memory ID.
-        
+
         If detect_conflicts=True, checks for existing memories about the same
         topic that contain contradictory information and updates/invalidates them.
-        If auto_connect=True (default), connects similar memories in the graph.
-        Set auto_connect=False for fast bulk ingestion.
         """
         import math
         import time
-        
+
         embedding = self.embedder.embed(text)
-        
+
         # Knowledge-update: detect conflicts with existing memories
         if detect_conflicts and self._graph_nodes:
             conflicts = self._find_conflicts(text, embedding)
             for conflict_id, conflict_info in conflicts.items():
                 old_content = conflict_info['content']
                 similarity = conflict_info['similarity']
-                
+
                 # High similarity + different content = likely update
                 if similarity > 0.7 and self._content_differs(old_content, text):
                     # Mark old memory as superseded
@@ -285,11 +296,16 @@ class NeuralMemory:
                     # Update in-memory graph
                     if conflict_id in self._graph_nodes:
                         self._graph_nodes[conflict_id]['embedding'] = embedding
-                    # Don't create duplicate - update existing
+                    # Update C++ index
+                    if self._cpp:
+                        try:
+                            self._cpp.store(embedding, label or text[:60], text)
+                        except Exception:
+                            pass
                     return conflict_id
-        
+
         mem_id = self.store.store(label or text[:60], text, embedding)
-        
+
         # Add to in-memory graph
         self._graph_nodes[mem_id] = {
             'embedding': embedding,
@@ -305,19 +321,18 @@ class NeuralMemory:
             except Exception:
                 pass
 
-        # Auto-connect to similar memories (skip if auto_connect=False for fast bulk ingestion)
-        if auto_connect:
-            for other_id, other_node in self._graph_nodes.items():
-                if other_id == mem_id:
-                    continue
-                sim = self._cosine_similarity(embedding, other_node['embedding'])
-                if sim > 0.15:  # Threshold for connection
-                    self._graph_nodes[mem_id]['connections'][other_id] = sim
-                    self._graph_nodes[other_id]['connections'][mem_id] = sim
-                    self.store.add_connection(mem_id, other_id, sim)
+        # Auto-connect to similar memories
+        for other_id, other_node in self._graph_nodes.items():
+            if other_id == mem_id:
+                continue
+            sim = self._cosine_similarity(embedding, other_node['embedding'])
+            if sim > 0.15:  # Threshold for connection
+                self._graph_nodes[mem_id]['connections'][other_id] = sim
+                self._graph_nodes[other_id]['connections'][mem_id] = sim
+                self.store.add_connection(mem_id, other_id, sim)
 
         return mem_id
-    
+
     def _find_conflicts(self, new_text: str, new_embedding: list[float], threshold: float = 0.6) -> dict:
         """Find memories that might conflict with the new text.
         Returns {memory_id: {similarity, content}} for potential conflicts.
@@ -332,50 +347,50 @@ class NeuralMemory:
                     'label': mem['label']
                 }
         return conflicts
-    
+
     def _content_differs(self, old_text: str, new_text: str) -> bool:
         """Check if two texts contain different information despite high similarity.
         Heuristics: different numbers, dates, negations, or significant word differences.
         """
         import re
-        
+
         old_clean = old_text.replace("[SUPERSEDED]", "").replace("[UPDATED TO]", "").strip()
-        
+
         # Extract numbers from both
         old_nums = set(re.findall(r'\d+\.?\d*', old_clean))
         new_nums = set(re.findall(r'\d+\.?\d*', new_text))
-        
+
         # Different numbers = different info
         if old_nums != new_nums and old_nums and new_nums:
             return True
-        
+
         # Check for negation differences
         negations = {'not', "n't", 'never', 'no', 'none', 'nothing', 'nowhere'}
         old_neg = any(n in old_clean.lower().split() for n in negations)
         new_neg = any(n in new_text.lower().split() for n in negations)
         if old_neg != new_neg:
             return True
-        
+
         # Check for date differences
         old_dates = set(re.findall(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2}', old_clean))
         new_dates = set(re.findall(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2}', new_text))
         if old_dates != new_dates and old_dates and new_dates:
             return True
-        
+
         # Check for significant content word differences (excluding common words)
         stopwords = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
                      'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
                      'should', 'may', 'might', 'can', 'shall', 'to', 'of', 'in', 'for',
                      'on', 'with', 'at', 'by', 'from', 'it', 'its', "it's", 'this', 'that',
                      'user', 'user\'s', 'my', 'i', 'me', 'we', 'our', 'you', 'your'}
-        
+
         def extract_keywords(text):
             words = set(re.findall(r'\b[a-z]+\b', text.lower()))
             return words - stopwords
-        
+
         old_kw = extract_keywords(old_clean)
         new_kw = extract_keywords(new_text)
-        
+
         # If more than 30% of keywords differ, it's a real update
         if old_kw and new_kw:
             shared = old_kw & new_kw
@@ -383,9 +398,9 @@ class NeuralMemory:
             diff_ratio = 1.0 - len(shared) / len(total)
             if diff_ratio > 0.3:
                 return True
-        
+
         return False
-    
+
     def recall(self, query: str, k: int = 5, temporal_weight: float = 0.2) -> list[dict]:
         """
         Retrieve memories related to query.
@@ -403,17 +418,17 @@ class NeuralMemory:
         query_vec = self.embedder.embed(query)
         now = time.time()
 
-        # C++ fast path: SIMD retrieve returns top-k candidates in microseconds
-        # Then apply temporal scoring on the small candidate set
+        # C++ fast path: SIMD retrieve returns top candidates in microseconds
         if self._cpp:
             try:
-                candidates = self._cpp.retrieve(query_vec, k=k * 3)
-                if candidates:
+                cpp_candidates = self._cpp.retrieve(query_vec, k=max(k * 3, 50))
+                if cpp_candidates:
                     scored = []
-                    for c in candidates:
+                    cpp_ids = set()
+                    for c in cpp_candidates:
                         cpp_id = c['id']
-                        # Map C++ index back to SQLite ID
                         mem_id = self._cpp_id_map.get(cpp_id, cpp_id)
+                        cpp_ids.add(mem_id)
                         sim = c.get('similarity', c.get('score', 0))
                         node = self._graph_nodes.get(mem_id, {})
 
@@ -428,21 +443,70 @@ class NeuralMemory:
                             'connections': list(node.get('connections', {}).keys()),
                         })
 
+                    # Python fallback for memories not in C++ index
+                    if len(scored) < k:
+                        for mem in self.store.get_all():
+                            if mem['id'] in cpp_ids:
+                                continue
+                            sim = self._cosine_similarity(query_vec, mem['embedding'])
+                            try:
+                                row = self.store.conn.execute(
+                                    "SELECT last_accessed FROM memories WHERE id = ?", (mem['id'],)
+                                ).fetchone()
+                                if row and row[0]:
+                                    age_hours = (now - row[0]) / 3600
+                                    temporal_score = math.exp(-0.693 * age_hours / 24)
+                                else:
+                                    temporal_score = 0.5
+                            except Exception:
+                                temporal_score = 0.5
+                            combined = (1 - temporal_weight) * sim + temporal_weight * temporal_score
+                            node = self._graph_nodes.get(mem['id'], {})
+                            scored.append({
+                                **mem, 'similarity': sim, 'temporal_score': temporal_score,
+                                'combined': combined,
+                                'connections': list(node.get('connections', {}).keys()),
+                            })
+
                     scored.sort(key=lambda x: -x['combined'])
-                    # Strip embeddings before returning — too large for context
-                    for s in scored:
-                        s.pop('embedding', None)
-                    # Touch accessed memories
                     for s in scored[:k]:
                         try:
                             self.store.touch(s['id'])
                         except Exception:
                             pass
-                    return scored[:k]
-            except Exception:
-                pass  # Fall through to Python path
 
-        # Python fallback: O(n) linear scan
+                    results = []
+                    seen = set()
+                    for mem in scored[:k]:
+                        if mem['id'] in seen:
+                            continue
+                        seen.add(mem['id'])
+                        conns = self.store.get_connections(mem['id'])
+                        connected = []
+                        for c in conns:
+                            other = c['target'] if c['source'] == mem['id'] else c['source']
+                            if other not in seen:
+                                other_mem = self.store.get(other)
+                                if other_mem:
+                                    connected.append({
+                                        'id': other,
+                                        'label': other_mem['label'],
+                                        'weight': c['weight']
+                                    })
+                        results.append({
+                            'id': mem['id'],
+                            'label': mem['label'],
+                            'content': mem['content'],
+                            'similarity': round(mem['similarity'], 4),
+                            'temporal_score': round(mem['temporal_score'], 4),
+                            'combined': round(mem['combined'], 4),
+                            'connections': connected[:3],
+                        })
+                    return results
+            except Exception:
+                pass  # Fall through to Python-only path
+
+        # Python-only path: O(n) linear scan
         scored = []
         for mem in self.store.get_all():
             sim = self._cosine_similarity(query_vec, mem['embedding'])
@@ -461,13 +525,11 @@ class NeuralMemory:
                 temporal_score = 0.5
 
             combined = (1 - temporal_weight) * sim + temporal_weight * temporal_score
-            entry = {**mem, 'similarity': sim, 'temporal_score': temporal_score, 'combined': combined}
-            entry.pop('embedding', None)  # Strip embedding — too large for context
-            scored.append(entry)
+            scored.append({**mem, 'similarity': sim, 'temporal_score': temporal_score, 'combined': combined})
 
         # Sort by combined score
         scored.sort(key=lambda x: -x['combined'])
-        
+
         # Enrich with connections via spreading activation
         results = []
         seen = set()
@@ -475,7 +537,7 @@ class NeuralMemory:
             if mem['id'] in seen:
                 continue
             seen.add(mem['id'])
-            
+
             # Get connections
             conns = self.store.get_connections(mem['id'])
             connected = []
@@ -489,7 +551,7 @@ class NeuralMemory:
                             'label': other_mem['label'],
                             'weight': c['weight']
                         })
-            
+
             results.append({
                 'id': mem['id'],
                 'label': mem['label'],
@@ -499,11 +561,11 @@ class NeuralMemory:
                 'combined': round(mem['combined'], 4),
                 'connections': connected[:3],  # Top 3
             })
-            
+
             self.store.touch(mem['id'])
-        
+
         return results
-    
+
     def think(self, start_id: int, depth: int = 3, decay: float = 0.85) -> list[dict]:
         """
         Spreading activation from a starting memory.
@@ -511,29 +573,29 @@ class NeuralMemory:
         """
         if start_id not in self._graph_nodes:
             return []
-        
+
         # BFS with activation propagation
         activation = {start_id: 1.0}
         visited = {start_id}
         queue = [(start_id, 1.0, 0)]
-        
+
         while queue:
             current, act, level = queue.pop(0)
             if level >= depth or act < 0.01:
                 continue
-            
+
             node = self._graph_nodes.get(current, {})
             for neighbor_id, weight in node.get('connections', {}).items():
                 propagated = act * weight * decay
                 if propagated < 0.01:
                     continue
-                
+
                 if neighbor_id not in activation or propagated > activation[neighbor_id]:
                     activation[neighbor_id] = propagated
                     if neighbor_id not in visited:
                         visited.add(neighbor_id)
                         queue.append((neighbor_id, propagated, level + 1))
-        
+
         # Build results (skip start node)
         results = []
         for node_id, act in activation.items():
@@ -546,78 +608,10 @@ class NeuralMemory:
                     'label': mem['label'],
                     'activation': round(act, 4),
                 })
-        
+
         results.sort(key=lambda x: -x['activation'])
         return results
-    
-    def recall_multihop(self, query: str, k: int = 5, hops: int = 2, temporal_weight: float = 0.2) -> list[dict]:
-        """
-        Multi-hop retrieval for complex queries requiring chained reasoning.
-        
-        1. Initial recall: find direct matches
-        2. Spreading activation from top results: discover connected facts
-        3. Re-rank by combined similarity + activation
-        
-        This handles questions like "What X happened after Y?" where you need
-        to find Y first, then find X connected to Y.
-        """
-        import numpy as np
-        
-        # Step 1: Direct retrieval
-        direct = self.recall(query, k=k, temporal_weight=temporal_weight)
-        seen = {r['id'] for r in direct}
-        all_results = list(direct)
-        
-        # Step 2: Multi-hop via spreading activation
-        for hop in range(hops - 1):
-            hop_results = []
-            for result in direct:
-                if result['id'] not in self._graph_nodes:
-                    continue
-                
-                # Get connected memories via spreading activation
-                activated = self.think(result['id'], depth=2, decay=0.7)
-                
-                for act in activated:
-                    if act['id'] in seen:
-                        continue
-                    
-                    mem = self.store.get(act['id'])
-                    if mem:
-                        # Score: activation strength * original result similarity
-                        activation_score = act['activation'] * result.get('similarity', 0.5)
-                        
-                        # Also compute direct similarity to query for these
-                        if mem.get('embedding'):
-                            query_emb = np.array(self.embedder.embed(query), dtype=np.float32)
-                            mem_emb = np.array(mem['embedding'], dtype=np.float32)
-                            nq = np.linalg.norm(query_emb)
-                            nm = np.linalg.norm(mem_emb)
-                            direct_sim = float(np.dot(query_emb, mem_emb) / (nq * nm)) if nq * nm > 0 else 0
-                        else:
-                            direct_sim = 0
-                        
-                        # Combined: 50% direct similarity + 50% activation from connected result
-                        combined = 0.5 * direct_sim + 0.5 * activation_score
-                        
-                        hop_results.append({
-                            'id': act['id'],
-                            'label': mem['label'],
-                            'content': mem['content'],
-                            'similarity': round(direct_sim, 4),
-                            'activation': round(act['activation'], 4),
-                            'combined': round(combined, 4),
-                            'hop': hop + 1,
-                            'connections': [],
-                        })
-                        seen.add(act['id'])
-            
-            all_results.extend(hop_results)
-        
-        # Step 3: Re-sort by combined score, return top k*2
-        all_results.sort(key=lambda x: -x.get('combined', x.get('similarity', 0)))
-        return all_results[:k * 2]
-    
+
     def connections(self, mem_id: int) -> list[dict]:
         """Get all connections for a memory."""
         conns = self.store.get_connections(mem_id)
@@ -633,11 +627,11 @@ class NeuralMemory:
                     'type': c['type']
                 })
         return results
-    
+
     def graph(self) -> dict:
         """Get knowledge graph stats and structure."""
         stats = self.store.get_stats()
-        
+
         # Build adjacency summary
         edges = []
         seen = set()
@@ -651,13 +645,13 @@ class NeuralMemory:
                         'to': other_id,
                         'weight': round(weight, 3)
                     })
-        
+
         return {
             'nodes': stats['memories'],
             'edges': len(edges),
             'top_edges': sorted(edges, key=lambda x: -x['weight'])[:10]
         }
-    
+
     def stats(self) -> dict:
         """Get memory statistics."""
         graph = self.store.stats() if hasattr(self.store, 'stats') else self.store.get_stats()
@@ -667,7 +661,7 @@ class NeuralMemory:
             'embedding_dim': self.dim,
             'embedding_backend': self.embedder.backend.__class__.__name__,
         }
-    
+
     def close(self):
         if self._cpp:
             try:
@@ -676,7 +670,7 @@ class NeuralMemory:
                 pass
             self._cpp = None
         self.store.close()
-    
+
     # Cython-accelerated ops (falls back to Python if unavailable)
     try:
         from fast_ops import cosine_similarity as _cosine_sim_fast
@@ -687,7 +681,6 @@ class NeuralMemory:
     def _cosine_similarity(a, b) -> float:
         if NeuralMemory._cosine_sim_fast is not None:
             import numpy as np
-            # Avoid repeated array creation for lists
             if not isinstance(a, np.ndarray):
                 a = np.asarray(a, dtype=np.float64)
             if not isinstance(b, np.ndarray):
@@ -697,9 +690,9 @@ class NeuralMemory:
         na = (sum(x*x for x in a)) ** 0.5
         nb = (sum(x*x for x in b)) ** 0.5
         return dot / (na * nb) if na and nb else 0.0
-    
+
     def __enter__(self):
         return self
-    
+
     def __exit__(self, *args):
         self.close()
