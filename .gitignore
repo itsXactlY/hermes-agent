@@ -32,6 +32,7 @@ data/*
 node_modules/
 browser-use/
 agent-browser/
+*.so
 # Private keys
 *.ppk
 *.pem
@@ -62,3 +63,4 @@ mini-swe-agent/
 .direnv/
 result
 website/static/api/skills-index.json
+
