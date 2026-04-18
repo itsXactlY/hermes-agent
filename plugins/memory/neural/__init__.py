@@ -133,7 +133,7 @@ class NeuralMemoryProvider(MemoryProvider):
         self._prefetch_result: str = ""
         self._prefetch_thread: Optional[threading.Thread] = None
         self._consolidation_thread: Optional[threading.Thread] = None
-        self._consolidation_running = False
+        self._consolidation_stop = threading.Event()  # set = stop requested
         self._turn_count = 0
 
     @property
@@ -271,12 +271,11 @@ class NeuralMemoryProvider(MemoryProvider):
         if interval <= 0:
             return  # Consolidation disabled
 
-        self._consolidation_running = True
+        self._consolidation_stop.clear()
 
         def _consolidate_loop():
-            while self._consolidation_running:
-                time.sleep(interval)
-                if not self._consolidation_running:
+            while not self._consolidation_stop.is_set():
+                if self._consolidation_stop.wait(timeout=interval):
                     break
                 try:
                     self._run_consolidation()
@@ -588,7 +587,7 @@ class NeuralMemoryProvider(MemoryProvider):
             except Exception:
                 pass
             self._dream = None
-        self._consolidation_running = False
+        self._consolidation_stop.set()
         if self._consolidation_thread and self._consolidation_thread.is_alive():
             self._consolidation_thread.join(timeout=2.0)
         if self._memory:
