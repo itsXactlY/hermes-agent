@@ -309,23 +309,19 @@ class CppDreamBackend(DreamBackend):
 
     def add_bridge(self, source_id: int, target_id: int,
                     weight: float = 0.3) -> None:
-        """Add bridge edge to connections table via MSSQL."""
+        """Add bridge edge to connections table via MSSQL (UPSERT)."""
         if not self._mssql_conn:
             return
         try:
-            # Check if connection already exists (either direction)
-            existing = self._mssql_conn.execute(
-                "SELECT id FROM connections "
-                "WHERE (source_id = ? AND target_id = ?) "
-                "OR (source_id = ? AND target_id = ?)",
-                source_id, target_id, target_id, source_id
-            ).fetchone()
-            if not existing:
-                self._mssql_conn.execute(
-                    "INSERT INTO connections (source_id, target_id, weight, edge_type) "
-                    "VALUES (?, ?, ?, ?)",
-                    source_id, target_id, weight, "bridge"
-                )
+            self._mssql_conn.execute(
+                "MERGE connections AS target "
+                "USING (VALUES (?, ?)) AS src(source_id, target_id) "
+                "ON target.source_id = src.source_id AND target.target_id = src.target_id "
+                "WHEN NOT MATCHED THEN INSERT (source_id, target_id, weight, edge_type) "
+                "VALUES (?, ?, ?, 'bridge');",
+                source_id, target_id,     # USING
+                source_id, target_id, weight  # INSERT
+            )
         except Exception as e:
             logger.debug("add_bridge failed: %s", e)
 
@@ -346,15 +342,20 @@ class CppDreamBackend(DreamBackend):
     def log_connection_change(self, source_id: int, target_id: int,
                                old_weight: float, new_weight: float,
                                reason: str) -> None:
-        """Log connection change to connection_history table."""
+        """Log connection change to connection_history table (UPSERT)."""
         if not self._mssql_conn:
             return
         try:
             self._mssql_conn.execute(
-                "INSERT INTO connection_history "
-                "(source_id, target_id, old_weight, new_weight, reason, changed_at) "
-                "VALUES (?, ?, ?, ?, ?, SYSUTCDATETIME())",
-                source_id, target_id, old_weight, new_weight, reason
+                "MERGE connection_history AS target "
+                "USING (VALUES (?, ?)) AS src(source_id, target_id) "
+                "ON target.source_id = src.source_id AND target.target_id = src.target_id "
+                "WHEN MATCHED THEN UPDATE SET old_weight=?, new_weight=?, reason=?, changed_at=SYSUTCDATETIME() "
+                "WHEN NOT MATCHED THEN INSERT (source_id, target_id, old_weight, new_weight, reason, changed_at) "
+                "VALUES (?, ?, ?, ?, ?, SYSUTCDATETIME());",
+                source_id, target_id,   # USING
+                old_weight, new_weight, reason,  # UPDATE SET
+                source_id, target_id, old_weight, new_weight, reason  # INSERT
             )
         except Exception as e:
             logger.debug("log_connection_change failed: %s", e)
