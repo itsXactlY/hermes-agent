@@ -36,7 +36,7 @@ class CSearchResult(ctypes.Structure):
         ("id", ctypes.c_uint64),
         ("score", ctypes.c_float),
         ("label", ctypes.c_char * 256),
-        ("content", ctypes.c_char * 1024),
+        ("content", ctypes.c_char * 4096),
     ]
 
 class CStats(ctypes.Structure):
@@ -252,11 +252,14 @@ class NeuralMemory:
                     cpp_id = self._cpp.store(emb, mem.get('label', ''), mem.get('content', ''))
                     self._cpp_id_map[cpp_id] = mem['id']
     
-    def remember(self, text: str, label: str = "", detect_conflicts: bool = True) -> int:
+    def remember(self, text: str, label: str = "", detect_conflicts: bool = True,
+                 auto_connect: bool = True) -> int:
         """Store a memory. Returns memory ID.
         
         If detect_conflicts=True, checks for existing memories about the same
         topic that contain contradictory information and updates/invalidates them.
+        If auto_connect=True (default), connects similar memories in the graph.
+        Set auto_connect=False for fast bulk ingestion.
         """
         import math
         import time
@@ -302,15 +305,16 @@ class NeuralMemory:
             except Exception:
                 pass
 
-        # Auto-connect to similar memories
-        for other_id, other_node in self._graph_nodes.items():
-            if other_id == mem_id:
-                continue
-            sim = self._cosine_similarity(embedding, other_node['embedding'])
-            if sim > 0.15:  # Threshold for connection
-                self._graph_nodes[mem_id]['connections'][other_id] = sim
-                self._graph_nodes[other_id]['connections'][mem_id] = sim
-                self.store.add_connection(mem_id, other_id, sim)
+        # Auto-connect to similar memories (skip if auto_connect=False for fast bulk ingestion)
+        if auto_connect:
+            for other_id, other_node in self._graph_nodes.items():
+                if other_id == mem_id:
+                    continue
+                sim = self._cosine_similarity(embedding, other_node['embedding'])
+                if sim > 0.15:  # Threshold for connection
+                    self._graph_nodes[mem_id]['connections'][other_id] = sim
+                    self._graph_nodes[other_id]['connections'][mem_id] = sim
+                    self.store.add_connection(mem_id, other_id, sim)
 
         return mem_id
     
@@ -382,6 +386,22 @@ class NeuralMemory:
         
         return False
     
+    def _compute_temporal_score(self, mem_id: int, now: float) -> float:
+        """Compute temporal decay score based on created_at timestamp."""
+        import math
+        try:
+            row = self.store.conn.execute(
+                "SELECT created_at FROM memories WHERE id = ?", (mem_id,)
+            ).fetchone()
+            if row and row[0]:
+                created = row[0]
+                if isinstance(created, (int, float)):
+                    age_hours = (now - created) / 3600
+                    return math.exp(-0.693 * age_hours / 24)
+            return 0.5
+        except Exception:
+            return 0.5
+
     def recall(self, query: str, k: int = 5, temporal_weight: float = 0.2) -> list[dict]:
         """
         Retrieve memories related to query.
@@ -419,12 +439,15 @@ class NeuralMemory:
                             'content': c.get('content', ''),
                             'embedding': node.get('embedding', []),
                             'similarity': sim,
-                            'temporal_score': 0.5,
-                            'combined': (1 - temporal_weight) * sim + temporal_weight * 0.5,
+                            'temporal_score': self._compute_temporal_score(mem_id, now),
+                            'combined': (1 - temporal_weight) * sim + temporal_weight * self._compute_temporal_score(mem_id, now),
                             'connections': list(node.get('connections', {}).keys()),
                         })
 
                     scored.sort(key=lambda x: -x['combined'])
+                    # Strip embeddings before returning — too large for context
+                    for s in scored:
+                        s.pop('embedding', None)
                     # Touch accessed memories
                     for s in scored[:k]:
                         try:
@@ -440,21 +463,14 @@ class NeuralMemory:
         for mem in self.store.get_all():
             sim = self._cosine_similarity(query_vec, mem['embedding'])
 
-            # Temporal score: exponential decay based on last_accessed
-            try:
-                row = self.store.conn.execute(
-                    "SELECT last_accessed FROM memories WHERE id = ?", (mem['id'],)
-                ).fetchone()
-                if row and row[0]:
-                    age_hours = (now - row[0]) / 3600
-                    temporal_score = math.exp(-0.693 * age_hours / 24)
-                else:
-                    temporal_score = 0.5
-            except Exception:
-                temporal_score = 0.5
+            # Temporal score: exponential decay based on created_at (not last_accessed)
+            # last_accessed gets updated on every touch(), which corrupts temporal queries
+            temporal_score = self._compute_temporal_score(mem['id'], now)
 
             combined = (1 - temporal_weight) * sim + temporal_weight * temporal_score
-            scored.append({**mem, 'similarity': sim, 'temporal_score': temporal_score, 'combined': combined})
+            entry = {**mem, 'similarity': sim, 'temporal_score': temporal_score, 'combined': combined}
+            entry.pop('embedding', None)  # Strip embedding — too large for context
+            scored.append(entry)
 
         # Sort by combined score
         scored.sort(key=lambda x: -x['combined'])
@@ -540,6 +556,74 @@ class NeuralMemory:
         
         results.sort(key=lambda x: -x['activation'])
         return results
+    
+    def recall_multihop(self, query: str, k: int = 5, hops: int = 2, temporal_weight: float = 0.2) -> list[dict]:
+        """
+        Multi-hop retrieval for complex queries requiring chained reasoning.
+        
+        1. Initial recall: find direct matches
+        2. Spreading activation from top results: discover connected facts
+        3. Re-rank by combined similarity + activation
+        
+        This handles questions like "What X happened after Y?" where you need
+        to find Y first, then find X connected to Y.
+        """
+        import numpy as np
+        
+        # Step 1: Direct retrieval
+        direct = self.recall(query, k=k, temporal_weight=temporal_weight)
+        seen = {r['id'] for r in direct}
+        all_results = list(direct)
+        
+        # Step 2: Multi-hop via spreading activation
+        for hop in range(hops - 1):
+            hop_results = []
+            for result in direct:
+                if result['id'] not in self._graph_nodes:
+                    continue
+                
+                # Get connected memories via spreading activation
+                activated = self.think(result['id'], depth=2, decay=0.7)
+                
+                for act in activated:
+                    if act['id'] in seen:
+                        continue
+                    
+                    mem = self.store.get(act['id'])
+                    if mem:
+                        # Score: activation strength * original result similarity
+                        activation_score = act['activation'] * result.get('similarity', 0.5)
+                        
+                        # Also compute direct similarity to query for these
+                        if mem.get('embedding'):
+                            query_emb = np.array(self.embedder.embed(query), dtype=np.float32)
+                            mem_emb = np.array(mem['embedding'], dtype=np.float32)
+                            nq = np.linalg.norm(query_emb)
+                            nm = np.linalg.norm(mem_emb)
+                            direct_sim = float(np.dot(query_emb, mem_emb) / (nq * nm)) if nq * nm > 0 else 0
+                        else:
+                            direct_sim = 0
+                        
+                        # Combined: 50% direct similarity + 50% activation from connected result
+                        combined = 0.5 * direct_sim + 0.5 * activation_score
+                        
+                        hop_results.append({
+                            'id': act['id'],
+                            'label': mem['label'],
+                            'content': mem['content'],
+                            'similarity': round(direct_sim, 4),
+                            'activation': round(act['activation'], 4),
+                            'combined': round(combined, 4),
+                            'hop': hop + 1,
+                            'connections': [],
+                        })
+                        seen.add(act['id'])
+            
+            all_results.extend(hop_results)
+        
+        # Step 3: Re-sort by combined score, return top k*2
+        all_results.sort(key=lambda x: -x.get('combined', x.get('similarity', 0)))
+        return all_results[:k * 2]
     
     def connections(self, mem_id: int) -> list[dict]:
         """Get all connections for a memory."""

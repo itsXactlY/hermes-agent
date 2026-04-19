@@ -119,6 +119,8 @@ class MSSQLStore:
             f'TrustServerCertificate=yes;'
         )
         self.conn = pyodbc.connect(self.conn_str, autocommit=True)
+        import threading
+        self._lock = threading.Lock()
         self._ensure_schema()
     
     def _ensure_schema(self):
@@ -184,7 +186,15 @@ class MSSQLStore:
     def add_connection(self, source: int, target: int, weight: float, edge_type: str = "similar"):
         cursor = self.conn.cursor()
         cursor.execute(
-            "INSERT INTO connections (source_id, target_id, weight, edge_type) VALUES (?, ?, ?, ?)",
+            "MERGE connections AS target "
+            "USING (VALUES (?, ?, ?, ?)) AS source (source_id, target_id, weight, edge_type) "
+            "ON target.source_id = source.source_id AND target.target_id = source.target_id "
+            "WHEN MATCHED THEN "
+            "    UPDATE SET weight = CASE WHEN source.weight > target.weight THEN source.weight ELSE target.weight END, "
+            "               edge_type = source.edge_type "
+            "WHEN NOT MATCHED THEN "
+            "    INSERT (source_id, target_id, weight, edge_type) "
+            "    VALUES (source.source_id, source.target_id, source.weight, source.edge_type);",
             source, target, weight, edge_type
         )
         self.conn.commit()

@@ -133,6 +133,18 @@ class DreamBackend:
                     confidence: float = 0.0) -> None:
         raise NotImplementedError
 
+    def prune_connection_history(self, keep_days: int = 7) -> int:
+        """Delete history entries older than keep_days. Returns count deleted."""
+        raise NotImplementedError
+
+    def prune_old_dream_sessions(self, keep_days: int = 30) -> int:
+        """Delete dream sessions older than keep_days. Returns count deleted."""
+        raise NotImplementedError
+
+    def prune_orphans(self) -> int:
+        """Delete connections pointing to non-existent memories."""
+        raise NotImplementedError
+
     def get_dream_stats(self) -> Dict[str, Any]:
         raise NotImplementedError
 
@@ -312,9 +324,11 @@ class SQLiteDreamBackend(DreamBackend):
                 (source_id, target_id, target_id, source_id)
             ).fetchone()
             if not existing:
+                # SQLite UPSERT: ON CONFLICT keeps highest weight
                 conn.execute(
                     "INSERT INTO connections (source_id, target_id, weight, created_at) "
-                    "VALUES (?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(source_id, target_id) DO UPDATE SET weight = MAX(weight, excluded.weight)",
                     (source_id, target_id, weight, time.time())
                 )
                 conn.commit()
@@ -339,9 +353,15 @@ class SQLiteDreamBackend(DreamBackend):
         conn = self._connect()
         try:
             conn.execute(
-                "INSERT INTO connection_history "
-                "(source_id, target_id, old_weight, new_weight, reason, changed_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "MERGE connection_history AS target "
+                "USING (VALUES (?, ?, ?, ?, ?, ?)) AS source (source_id, target_id, old_weight, new_weight, reason, changed_at) "
+                "ON target.source_id = source.source_id AND target.target_id = source.target_id "
+                "WHEN MATCHED THEN "
+                "    UPDATE SET old_weight = source.old_weight, new_weight = source.new_weight, "
+                "               reason = source.reason, changed_at = source.changed_at "
+                "WHEN NOT MATCHED THEN "
+                "    INSERT (source_id, target_id, old_weight, new_weight, reason, changed_at) "
+                "    VALUES (source.source_id, source.target_id, source.old_weight, source.new_weight, source.reason, source.changed_at);",
                 (source_id, target_id, old_weight, new_weight, reason, time.time())
             )
             conn.commit()
@@ -360,6 +380,48 @@ class SQLiteDreamBackend(DreamBackend):
                 (session_id, insight_type, source_memory_id, content, confidence, time.time())
             )
             conn.commit()
+        finally:
+            conn.close()
+
+    def prune_connection_history(self, keep_days: int = 7) -> int:
+        """Delete history entries older than keep_days."""
+        conn = self._connect()
+        try:
+            cutoff = time.time() - (keep_days * 86400)
+            count = conn.execute(
+                "DELETE FROM connection_history WHERE changed_at < ?",
+                (cutoff,)
+            ).rowcount
+            conn.commit()
+            return count
+        finally:
+            conn.close()
+
+    def prune_old_dream_sessions(self, keep_days: int = 30) -> int:
+        """Delete dream sessions older than keep_days."""
+        conn = self._connect()
+        try:
+            cutoff = time.time() - (keep_days * 86400)
+            count = conn.execute(
+                "DELETE FROM dream_sessions WHERE started_at < ?",
+                (cutoff,)
+            ).rowcount
+            conn.commit()
+            return count
+        finally:
+            conn.close()
+
+    def prune_orphans(self) -> int:
+        """Delete connections pointing to non-existent memories."""
+        conn = self._connect()
+        try:
+            count = conn.execute(
+                "DELETE FROM connections "
+                "WHERE source_id NOT IN (SELECT id FROM memories) "
+                "OR target_id NOT IN (SELECT id FROM memories)"
+            ).rowcount
+            conn.commit()
+            return count
         finally:
             conn.close()
 
@@ -591,6 +653,21 @@ class DreamEngine:
 
             # Prune dead connections
             stats["pruned"] = self._backend.prune_weak(0.05)
+
+            # Periodic maintenance: prune old history + orphans every 50 cycles
+            if self._dream_count % 50 == 0:
+                try:
+                    pruned_hist = self._backend.prune_connection_history(keep_days=7)
+                    if pruned_hist:
+                        logger.info("Pruned %d old connection_history entries", pruned_hist)
+                    pruned_sessions = self._backend.prune_old_dream_sessions(keep_days=30)
+                    if pruned_sessions:
+                        logger.info("Pruned %d old dream sessions", pruned_sessions)
+                    pruned_orphans = self._backend.prune_orphans()
+                    if pruned_orphans:
+                        logger.info("Pruned %d orphan connections", pruned_orphans)
+                except Exception as e:
+                    logger.debug("Maintenance cleanup error: %s", e)
 
             self._backend.finish_session(session_id, stats)
 

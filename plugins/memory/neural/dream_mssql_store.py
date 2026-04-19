@@ -312,8 +312,14 @@ class DreamMSSQLStore:
         if cursor.fetchone():
             return
         self.conn.execute(
-            "INSERT INTO connections (source_id, target_id, weight) "
-            "VALUES (?, ?, ?)",
+            "MERGE connections AS target "
+            "USING (VALUES (?, ?, ?)) AS source (source_id, target_id, weight) "
+            "ON target.source_id = source.source_id AND target.target_id = source.target_id "
+            "WHEN MATCHED THEN "
+            "    UPDATE SET weight = CASE WHEN source.weight > target.weight THEN source.weight ELSE target.weight END "
+            "WHEN NOT MATCHED THEN "
+            "    INSERT (source_id, target_id, weight) "
+            "    VALUES (source.source_id, source.target_id, source.weight);",
             source_id, target_id, weight
         )
         self.conn.commit()
@@ -333,11 +339,18 @@ class DreamMSSQLStore:
                                old_weight: float, new_weight: float,
                                reason: str) -> None:
         """Log a connection weight change."""
+        now = datetime.fromtimestamp(time.time())
         self.conn.execute(
-            "INSERT INTO connection_history "
-            "(source_id, target_id, old_weight, new_weight, reason, changed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            source_id, target_id, old_weight, new_weight, reason, datetime.fromtimestamp(time.time())
+            "MERGE connection_history AS target "
+            "USING (VALUES (?, ?, ?, ?, ?, ?)) AS source (source_id, target_id, old_weight, new_weight, reason, changed_at) "
+            "ON target.source_id = source.source_id AND target.target_id = source.target_id "
+            "WHEN MATCHED THEN "
+            "    UPDATE SET old_weight = source.old_weight, new_weight = source.new_weight, "
+            "               reason = source.reason, changed_at = source.changed_at "
+            "WHEN NOT MATCHED THEN "
+            "    INSERT (source_id, target_id, old_weight, new_weight, reason, changed_at) "
+            "    VALUES (source.source_id, source.target_id, source.old_weight, source.new_weight, source.reason, source.changed_at);",
+            source_id, target_id, old_weight, new_weight, reason, now
         )
         self.conn.commit()
 
@@ -422,6 +435,45 @@ class DreamMSSQLStore:
             "total_insights": row[5],
             "insight_types": insight_types,
         }
+
+    def prune_connection_history(self, keep_days: int = 7) -> int:
+        """Prune old connection history entries to prevent unbounded growth."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "DELETE FROM connection_history "
+            "WHERE changed_at < DATEADD(day, -?, SYSUTCDATETIME())",
+            keep_days
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    def prune_old_dream_sessions(self, keep_days: int = 30) -> int:
+        """Prune old dream sessions and their insights."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "DELETE di FROM dream_insights di "
+            "INNER JOIN dream_sessions ds ON di.session_id = ds.id "
+            "WHERE ds.started_at < DATEADD(day, -?, SYSUTCDATETIME())",
+            keep_days
+        )
+        cursor.execute(
+            "DELETE FROM dream_sessions "
+            "WHERE started_at < DATEADD(day, -?, SYSUTCDATETIME())",
+            keep_days
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    def prune_orphans(self) -> int:
+        """Delete connections pointing to non-existent memories in MSSQL."""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            DELETE FROM connections
+            WHERE source_id NOT IN (SELECT id FROM memories)
+               OR target_id NOT IN (SELECT id FROM memories)
+        """)
+        self.conn.commit()
+        return cursor.rowcount
 
     def close(self):
         """Close the connection."""
