@@ -388,7 +388,7 @@ class NeuralMemoryProvider(MemoryProvider):
             self._memory = NeuralMemory(
                 db_path=self._config["db_path"],
                 embedding_backend=self._config["embedding_backend"],
-                use_cpp=True,
+                use_cpp=False,  # Hopfield network biased on bench data — Python path is correct
             )
 
             # Start Dream Engine (background consolidation)
