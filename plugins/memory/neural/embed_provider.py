@@ -697,6 +697,35 @@ class TfidfSvdBackend:
         return [row.tolist() for row in batch_result]
 
 
+class FastEmbedBackend:
+    """FastEmbed ONNX backend — fast, low memory, no PyTorch dependency."""
+    DEFAULT_MODEL = "intfloat/multilingual-e5-large"
+    
+    def __init__(self, model_name: str = None, dim: int = None):
+        from fastembed import TextEmbedding
+        self._model_name = model_name or os.environ.get("EMBED_MODEL", self.DEFAULT_MODEL)
+        self._model = TextEmbedding(model_name=self._model_name)
+        # Get dim from first embed
+        test_vec = list(self._model.embed(["test"]))[0]
+        self._dim = dim or len(test_vec)
+        print(f"[embed] FastEmbed loaded: {self._model_name} ({self._dim}d)")
+    
+    @property
+    def dim(self) -> int:
+        return self._dim
+    
+    def embed(self, text: str) -> list[float]:
+        if not text or not text.strip():
+            return [0.0] * self._dim
+        vec = list(self._model.embed([text]))[0]
+        return list(vec) if hasattr(vec, 'tolist') else list(vec)
+    
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        clean = [t if t and t.strip() else " " for t in texts]
+        results = list(self._model.embed(clean))
+        return [list(r) if hasattr(r, 'tolist') else list(r) for r in results]
+
+
 class HashBackend:
     """Simple hash-based embedding (zero dependencies)"""
     def __init__(self, dim: int = DIMENSION):
@@ -742,6 +771,8 @@ class EmbeddingProvider:
         
         if backend == "auto":
             self.backend = self._auto_detect()
+        elif backend == "fastembed":
+            self.backend = FastEmbedBackend()
         elif backend == "sentence-transformers":
             self.backend = SentenceTransformerBackend()
         elif backend == "tfidf":
@@ -771,6 +802,15 @@ class EmbeddingProvider:
         except (ImportError, Exception) as e:
             if not isinstance(e, ImportError):
                 print(f"[embed] sentence-transformers failed: {e}", file=sys.stderr)
+        
+        # FastEmbed (ONNX — fast, low memory)
+        try:
+            import fastembed
+            print("[embed] Auto-selected: FastEmbed (ONNX)")
+            return FastEmbedBackend()
+        except (ImportError, Exception) as e:
+            if not isinstance(e, ImportError):
+                print(f"[embed] FastEmbed failed: {e}", file=sys.stderr)
         
         # TF-IDF+SVD
         try:
