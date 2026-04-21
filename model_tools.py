@@ -365,6 +365,22 @@ def get_tool_definitions(
 _AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
+# Memory manager reference — set by run_agent.py after init.
+# Allows handle_function_call() to route memory tools (neural_remember, etc.)
+# without requiring callers to pre-check memory_manager.has_tool().
+_memory_manager_ref = None
+
+
+def set_memory_manager(mm) -> None:
+    """Register the memory manager for tool call routing.
+
+    Called by run_agent.py after MemoryManager init. This lets
+    handle_function_call() route neural_remember/recall/think/graph
+    without each caller needing a pre-check.
+    """
+    global _memory_manager_ref
+    _memory_manager_ref = mm
+
 
 # =========================================================================
 # Tool argument type coercion
@@ -521,11 +537,18 @@ def handle_function_call(
                 enabled_tools=sandbox_enabled,
             )
         else:
-            result = registry.dispatch(
-                function_name, function_args,
-                task_id=task_id,
-                user_task=user_task,
-            )
+            # Memory provider tools (neural_remember, neural_recall, etc.) are
+            # injected into self.tools but NOT registered in the tool registry.
+            # Route them through the memory manager before falling to registry.
+            global _memory_manager_ref
+            if _memory_manager_ref and _memory_manager_ref.has_tool(function_name):
+                result = _memory_manager_ref.handle_tool_call(function_name, function_args)
+            else:
+                result = registry.dispatch(
+                    function_name, function_args,
+                    task_id=task_id,
+                    user_task=user_task,
+                )
 
         try:
             from hermes_cli.plugins import invoke_hook

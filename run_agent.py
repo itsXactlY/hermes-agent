@@ -1188,6 +1188,10 @@ class AIAgent:
                 _tname = _schema.get("name", "")
                 if _tname:
                     self.valid_tool_names.add(_tname)
+            # Register memory manager in model_tools so handle_function_call()
+            # can route neural_remember/recall/think/graph without pre-checks
+            from model_tools import set_memory_manager as _smm
+            _smm(self._memory_manager)
 
         # Skills config: nudge interval for skill creation reminders
         self._skill_nudge_interval = 10
@@ -2938,6 +2942,12 @@ class AIAgent:
                 pass
             try:
                 self._memory_manager.shutdown_all()
+            except Exception:
+                pass
+            # Clear module-level ref so handle_function_call stops routing to dead manager
+            try:
+                from model_tools import set_memory_manager as _smm
+                _smm(None)
             except Exception:
                 pass
         # Notify context engine of session end (flush DAG, close DBs, etc.)
