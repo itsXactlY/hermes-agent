@@ -351,7 +351,26 @@ class MemoryManager:
                 provider.shutdown()
             except Exception as e:
                 logger.warning(
-                    "Memory provider '%s' shutdown failed: %s",
+                    "Memory provider '%s' initialize failed: %s",
+                    provider.name, e,
+                )
+
+    def update_session_id(self, session_id: str) -> None:
+        """Propagate new session_id to all providers after session split (e.g. compression).
+
+        Neural Memory uses session_id as the archive tag. When compression creates
+        a new session_id, providers must update their internal _session_id so that
+        subsequent archive_compression() calls and prefetch queries use the new tag.
+        """
+        for provider in self._providers:
+            try:
+                provider.update_session_id(session_id)
+            except AttributeError:
+                # Provider doesn't implement update_session_id — skip
+                pass
+            except Exception as e:
+                logger.debug(
+                    "Memory provider '%s' update_session_id failed: %s",
                     provider.name, e,
                 )
 

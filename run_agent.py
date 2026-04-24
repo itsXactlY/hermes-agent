@@ -6617,14 +6617,23 @@ class AIAgent:
         # Pre-compression memory flush: let the model save memories before they're lost
         self.flush_memories(messages, min_turns=0)
 
-        # Notify external memory provider before compression discards context
+        # Notify external memory provider before compression discards context.
+        # on_pre_compress archives everything to neural memory losslessly so
+        # nothing is lost when context compresses.  The return value is the
+        # provider's confirmation text — inject it so the model knows archiving ran.
+        _neural_archive_note = ""
         if self._memory_manager:
             try:
-                self._memory_manager.on_pre_compress(messages)
+                _neural_archive_note = self._memory_manager.on_pre_compress(messages) or ""
             except Exception:
                 pass
 
         compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
+
+        # If neural memory archived turns, inject the confirmation as a system
+        # note so the model knows context was preserved and can be retrieved.
+        if _neural_archive_note:
+            compressed.append({"role": "system", "content": _neural_archive_note})
 
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:
@@ -6661,6 +6670,16 @@ class AIAgent:
                 self._last_flushed_db_idx = 0
             except Exception as e:
                 logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
+
+        # CRITICAL: propagate new session_id to ALL external memory providers.
+        # Neural Memory uses session_id as the archive_tag — without this update,
+        # prefetch_after_compress searches the OLD session tag while new archives
+        # go to the NEW session tag, so no recalled context is found.
+        if self._memory_manager:
+            try:
+                self._memory_manager.update_session_id(self.session_id)
+            except Exception as e:
+                logger.debug("Memory provider session_id update failed: %s", e)
 
         # Warn on repeated compressions (quality degrades with each pass)
         _cc = self.context_compressor.compression_count
