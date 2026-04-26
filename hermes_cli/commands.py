@@ -117,6 +117,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("normal", "fast", "status", "on", "off")),
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
                cli_only=True, args_hint="[name]"),
+    CommandDef("dashboard", "Launch the Hermes neural dashboard TUI", "Configuration",
+               cli_only=True, aliases=("neural",)),
     CommandDef("voice", "Toggle voice mode", "Configuration",
                args_hint="[on|off|tts|status]", subcommands=("on", "off", "tts", "status")),
 

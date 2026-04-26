@@ -171,7 +171,7 @@ class IterationBudget:
     """Thread-safe iteration counter for an agent.
 
     Each agent (parent or subagent) gets its own ``IterationBudget``.
-    The parent's budget is capped at ``max_iterations`` (default 90).
+    The parent's budget is capped at ``max_iterations`` (default 200 for deep multi-persona).
     Each subagent gets an independent budget capped at
     ``delegation.max_iterations`` (default 50) — this means total
     iterations across parent + subagents can exceed the parent's cap.
@@ -524,7 +524,7 @@ class AIAgent:
         command: str = None,
         args: list[str] | None = None,
         model: str = "",
-        max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
+        max_iterations: int = 200,  # Default tool-calling iterations (shared with subagents) — deep multi-persona mode
         tool_delay: float = 1.0,
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
@@ -10434,7 +10434,7 @@ def main(
     model: str = "",
     api_key: str = None,
     base_url: str = "",
-    max_turns: int = 10,
+        max_iterations: int = 200,
     enabled_toolsets: str = None,
     disabled_toolsets: str = None,
     list_tools: bool = False,

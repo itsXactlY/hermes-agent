@@ -52,9 +52,10 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-# Directories/files to include in snapshots (relative to hermes_home)
+# Directories/files to include in snapshots (relative to hermes_home).
+# state.db is intentionally excluded — it's 135MB and changes every tool call.
+# The WAL handles state.db incrementally; restore() falls back to WAL for it.
 INCLUDE_FILES: Set[str] = {
-    "state.db",
     "config.yaml",
     "auth.json",
     "cron/jobs.json",
@@ -120,6 +121,7 @@ _DEBOUNCE_MEMORY = 15
 _last_snapshot_time: float = 0
 _last_state_hash: str = ""
 _debounce_lock = threading.Lock()
+_snapshot_count: int = 0  # for periodic prune
 
 
 # ---------------------------------------------------------------------------
@@ -738,6 +740,23 @@ class SnapshotEngine:
 
     # -- Restore -------------------------------------------------------------
 
+    def _wal_state_db_at(self, snapshot_id: str) -> Optional[str]:
+        """Return the SHA256 of the latest state.db WAL entry at or before snapshot_id."""
+        try:
+            conn = sqlite3.connect(str(self.history_db))
+            row = conn.execute("SELECT created_at FROM snapshots WHERE id = ?", (snapshot_id,)).fetchone()
+            if not row:
+                conn.close()
+                return None
+            row = conn.execute(
+                "SELECT sha256 FROM wal_entries WHERE rel_path = 'state.db' AND timestamp <= ? ORDER BY timestamp DESC LIMIT 1",
+                (row[0],),
+            ).fetchone()
+            conn.close()
+            return row[0] if row else None
+        except Exception:
+            return None
+
     def restore(self, snapshot_id: str) -> bool:
         """Restore state from a snapshot.
 
@@ -759,6 +778,12 @@ class SnapshotEngine:
 
         with open(manifest_path) as f:
             manifest: Dict[str, str] = json.load(f)
+
+        # state.db is no longer snapshotted directly — recover from WAL
+        if "state.db" not in manifest:
+            db_sha = self._wal_state_db_at(snapshot_id)
+            if db_sha:
+                manifest["state.db"] = db_sha
 
         restored = 0
         for rel_path, sha in manifest.items():
@@ -885,8 +910,8 @@ class SnapshotEngine:
 
     def prune(
         self,
-        keep_last: int = 100,
-        keep_hourly: int = 24,
+        keep_last: int = 10,
+        keep_hourly: int = 6,
         keep_daily: int = 3,
     ) -> int:
         """Prune old snapshots. Returns count of deleted snapshots.
@@ -1041,8 +1066,17 @@ def auto_snapshot(
         _last_snapshot_time = now
 
     try:
+        global _snapshot_count
         engine = _get_engine()
-        return engine.snapshot(label=label, trigger=trigger)
+        snap_id = engine.snapshot(label=label, trigger=trigger)
+        if snap_id:
+            _snapshot_count += 1
+            if _snapshot_count % 10 == 0:
+                try:
+                    engine.prune()
+                except Exception:
+                    pass
+        return snap_id
     except Exception as e:
         logger.warning("Auto-snapshot failed: %s", e)
         return None
@@ -1094,7 +1128,7 @@ def diff(snap_id_a: str, snap_id_b: str) -> Dict[str, Any]:
     return _get_engine().diff(snap_id_a, snap_id_b)
 
 
-def prune(keep_last: int = 100, keep_hourly: int = 24, keep_daily: int = 3) -> int:
+def prune(keep_last: int = 10, keep_hourly: int = 6, keep_daily: int = 3) -> int:
     """Prune old snapshots. Shorthand for engine.prune()."""
     return _get_engine().prune(keep_last=keep_last, keep_hourly=keep_hourly, keep_daily=keep_daily)
 

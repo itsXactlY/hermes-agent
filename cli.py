@@ -5639,6 +5639,8 @@ class HermesCLI:
                     _cprint(f"  Queued: {payload[:80]}{'...' if len(payload) > 80 else ''}")
         elif canonical == "skin":
             self._handle_skin_command(cmd_original)
+        elif canonical == "dashboard":
+            self._handle_dashboard_command()
         elif canonical == "voice":
             self._handle_voice_command(cmd_original)
         else:
@@ -6288,6 +6290,78 @@ class HermesCLI:
         print("  Note: banner colors will update on next session start.")
         if self._apply_tui_skin_style():
             print("  Prompt + TUI colors updated.")
+
+    def _handle_dashboard_command(self):
+        """Handle /dashboard — launch the Hermes neural dashboard TUI."""
+        import subprocess
+        import sys
+
+        # Find the hermes-agent venv python
+        venv_python = sys.prefix + "/bin/python3"
+        if not hasattr(sys, 'real_prefix') and sys.base_prefix == sys.prefix:
+            # Not in a venv, use whatever python is running
+            venv_python = sys.executable
+
+        dashboard_path = Path(__file__).parent / "terminal" / "dashboard.py"
+
+        if not dashboard_path.exists():
+            print(f"  Dashboard not found at: {dashboard_path}")
+            return
+
+        try:
+            from rich.console import Console
+            from rich.panel import Panel
+            from rich.text import Text
+
+            console = Console()
+            console.print(Panel(
+                Text("⟨ HERMES NEURAL DASHBOARD ⟩\n", style="bold #f5b731"),
+                Text("Launching dashboard in a new terminal window...\n", style="#666677"),
+                Text("Controls: q=quit  r=refresh  m=toggle matrix", style="#f5b731"),
+                border_style="#f5b731",
+                padding=(1, 2),
+            ))
+        except Exception:
+            print("  ⟨ HERMES NEURAL DASHBOARD ⟩  — launching...")
+
+        # Launch in a subprocess (detached)
+        try:
+            import os
+            # Try to use a terminal launcher
+            if os.environ.get("DISPLAY"):
+                # Try gnome-terminal, kitty, or alacritty
+                for term in ["gnome-terminal", "kitty", "alacritty", "konsole", "xfce4-terminal"]:
+                    launcher = shutil.which(term)
+                    if launcher:
+                        if term in ("gnome-terminal", "xfce4-terminal"):
+                            subprocess.Popen(
+                                [launcher, "--", venv_python, str(dashboard_path)],
+                                start_new_session=True,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                        elif term == "kitty":
+                            subprocess.Popen(
+                                [launcher, venv_python, str(dashboard_path)],
+                                start_new_session=True,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                        else:
+                            subprocess.Popen(
+                                [launcher, "-e", venv_python, str(dashboard_path)],
+                                start_new_session=True,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                        print(f"  Dashboard launched in {term}")
+                        return
+            # Fallback: run in foreground
+            print("  No graphical terminal detected. Running in foreground (Ctrl+C to exit)...")
+            subprocess.run([venv_python, str(dashboard_path)], check=False)
+        except Exception as e:
+            print(f"  Failed to launch dashboard: {e}")
+            print(f"  Run manually: {venv_python} {dashboard_path}")
 
     def _toggle_verbose(self):
         """Cycle tool progress mode: off → new → all → verbose → off."""

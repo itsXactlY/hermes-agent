@@ -499,7 +499,52 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
 [#C75B1D]⠀⠀⠀⠀⠈⠙⠛⠶⠤⠭⠭⠤⠶⠛⠋⠁⠀⠀⠀⠀[/]
 [#F29C38]⠀⠀⠀⠀⠀⠀⠀⠀⣰⡿⢿⣆⠀⠀⠀⠀⠀⠀⠀⠀⠀[/]
 [#F29C38]⠀⠀⠀⠀⠀⠀⠀⣼⡟⠀⠀⢻⣧⠀⠀⠀⠀⠀⠀⠀⠀[/]
-[dim #7A3511]⠀⠀⠀⠀⠀⠀⠀tail flame lit⠀⠀⠀⠀⠀⠀⠀⠀[/]""",
+[dim #7A3511]⠀⠀⠀⠀⠀⠀⠀tail flame lit　　　　　    [/]""",
+    },
+    "hermes": {
+        "name": "hermes",
+        "description": "Neural dashboard — amber on dark with matrix rain aesthetic",
+        "colors": {
+            "banner_border": "#f5b731",
+            "banner_title": "#f5b731",
+            "banner_accent": "#ffcc00",
+            "banner_dim": "#666677",
+            "banner_text": "#f5b731",
+            "ui_accent": "#f5b731",
+            "ui_label": "#ff8800",
+            "ui_ok": "#33cc33",
+            "ui_error": "#ff3333",
+            "ui_warn": "#ff8800",
+            "prompt": "#f5b731",
+            "input_rule": "#f5b731",
+            "response_border": "#f5b731",
+            "session_label": "#f5b731",
+            "session_border": "#333344",
+        },
+        "spinner": {
+            "waiting_faces": ["(⌁)", "(⚡)", "(◈)", "(◇)", "(▸)"],
+            "thinking_faces": ["(⌁)", "(◈)", "(▸)", "(⚡)", "(◉)"],
+            "thinking_verbs": [
+                "routing signals", "indexing memories", "weaving thought",
+                "bridging contexts", "spinning insight", "threading cognition",
+                "routing synapses", "pulsing neural paths",
+            ],
+            "wings": [
+                ["⟪⌁", "⌁⟫"],
+                ["⟪⚡", "⚡⟫"],
+                ["⟪▸", "▸⟫"],
+                ["⟪◈", "◈⟫"],
+            ],
+        },
+        "branding": {
+            "agent_name": "Hermes Agent",
+            "welcome": "Welcome to Hermes Agent — neural dashboard active. Type your message or /help for commands.",
+            "goodbye": "Signing off. ⚕",
+            "response_label": " ⚕ Hermes ",
+            "prompt_symbol": "❯ ",
+            "help_header": "(⌁) Available Commands",
+        },
+        "tool_prefix": "┊",
     },
 }
 

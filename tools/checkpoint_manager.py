@@ -36,6 +36,9 @@ logger = logging.getLogger(__name__)
 
 CHECKPOINT_BASE = get_hermes_home() / "checkpoints"
 
+# Directories that should never be checkpointed
+EXCLUDE_WORKING_DIRS: Set[str] = {"/tmp", "/var/tmp", "/proc", "/sys", "/dev", "/run"}
+
 DEFAULT_EXCLUDES = [
     "node_modules/",
     "dist/",
@@ -296,9 +299,12 @@ class CheckpointManager:
 
         abs_dir = str(_normalize_path(working_dir))
 
-        # Skip root, home, and other overly broad directories
+        # Skip root, home, and other overly broad/excluded directories
         if abs_dir in ("/", str(Path.home())):
             logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
+            return False
+        if abs_dir in EXCLUDE_WORKING_DIRS or any(abs_dir.startswith(d + "/") for d in EXCLUDE_WORKING_DIRS):
+            logger.debug("Checkpoint skipped: excluded directory (%s)", abs_dir)
             return False
 
         # Already checkpointed this turn?
@@ -569,27 +575,31 @@ class CheckpointManager:
         return True
 
     def _prune(self, shadow_repo: Path, working_dir: str) -> None:
-        """Keep only the last max_snapshots commits via orphan reset."""
-        ok, stdout, _ = _run_git(
-            ["rev-list", "--count", "HEAD"], shadow_repo, working_dir,
-        )
+        """Prune old commits and GC the shadow repo."""
+        ok, stdout, _ = _run_git(["rev-list", "--count", "HEAD"], shadow_repo, working_dir)
         if not ok:
             return
-
         try:
             count = int(stdout)
         except ValueError:
             return
 
-        if count <= self.max_snapshots:
-            return
+        if count > self.max_snapshots:
+            # Mark the commit at max_snapshots depth as a shallow root —
+            # git treats it as having no parent, making older commits unreachable.
+            ok2, new_root, _ = _run_git(
+                ["rev-list", "--max-count=1", f"HEAD~{self.max_snapshots - 1}"],
+                shadow_repo, working_dir,
+            )
+            if ok2 and new_root:
+                try:
+                    (shadow_repo / "shallow").write_text(new_root.strip() + "\n")
+                except Exception as e:
+                    logger.debug("Shallow write failed: %s", e)
 
-        # For simplicity, we don't actually prune — git's pack mechanism
-        # handles this efficiently, and the objects are small.  The log
-        # listing is already limited by max_snapshots.
-        # Full pruning would require rebase --onto or filter-branch which
-        # is fragile for a background feature.  We just limit the log view.
-        logger.debug("Checkpoint repo has %d commits (limit %d)", count, self.max_snapshots)
+        # Always GC to pack objects with delta compression and prune unreachable blobs
+        _run_git(["gc", "--quiet", "--prune=now"], shadow_repo, working_dir)
+        logger.debug("Checkpoint gc: %d commits (limit %d)", count, self.max_snapshots)
 
 
 def format_checkpoint_list(checkpoints: List[Dict], directory: str) -> str:

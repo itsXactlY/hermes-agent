@@ -1,0 +1,22 @@
+// Zellij configuration for Hermes Terminal
+// Amber #f5b731 on Dark #1a1a24
+// Copy to: ~/.config/zellij/config.kdl
+// Or merge into existing config.kdl
+
+theme "hermes-amber"
+
+themes {
+    hermes-amber {
+        fg "#f5b731"
+        bg "#1a1a24"
+        black "#1a1a24"
+        red "#ff3333"
+        green "#33cc33"
+        yellow "#f5b731"
+        blue "#3333ff"
+        magenta "#ff33ff"
+        cyan "#33ccff"
+        white "#ffffff"
+        orange "#ff8800"
+    }
+}
