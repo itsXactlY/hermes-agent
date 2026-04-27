@@ -47,12 +47,7 @@ let
         humanfriendly = [ ];
       };
 
-      onnxruntime = mkPrebuiltOverride final python311.pkgs.onnxruntime {
-        coloredlogs = [ ];
-        numpy = [ ];
-        packaging = [ ];
-      };
-
+      # onnxruntime removed — no longer needed (2026-04)
       ctranslate2 = mkPrebuiltOverride final python311.pkgs.ctranslate2 {
         numpy = [ ];
         pyyaml = [ ];
@@ -62,7 +57,6 @@ let
         av = [ ];
         ctranslate2 = [ ];
         huggingface-hub = [ ];
-        onnxruntime = [ ];
         tokenizers = [ ];
         tqdm = [ ];
       };

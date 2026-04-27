@@ -10,7 +10,7 @@
 #
 # This script:
 # 1. Detects desktop/server vs Android/Termux setup path
-# 2. Creates a Python 3.11 virtual environment
+# 2. Creates a Python virtual environment (defaults to 3.13, overridable)
 # 3. Installs the appropriate dependency set for the platform
 # 4. Creates .env from template (if not exists)
 # 5. Symlinks the 'hermes' CLI command into a user-facing bin dir
@@ -29,7 +29,7 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-PYTHON_VERSION="3.11"
+PYTHON_VERSION="${PYTHON_VERSION:-3.13}"
 
 is_termux() {
     [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"com.termux/files/usr"* ]]
@@ -112,7 +112,7 @@ if is_termux; then
             PYTHON_FOUND_VERSION=$($PYTHON_PATH --version 2>/dev/null)
             echo -e "${GREEN}✓${NC} $PYTHON_FOUND_VERSION found"
         else
-            echo -e "${RED}✗${NC} Termux Python must be 3.11+"
+            echo -e "${RED}✗${NC} Termux Python must be 3.13+"
             echo "    Run: pkg install python"
             exit 1
         fi

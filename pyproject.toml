@@ -7,7 +7,7 @@ name = "hermes-agent"
 version = "0.8.0"
 description = "The self-improving AI agent — creates skills from experience, improves them during use, and runs anywhere"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 authors = [{ name = "Nous Research" }]
 license = { text = "MIT" }
 dependencies = [
@@ -47,8 +47,7 @@ matrix = ["mautrix[encryption]>=0.20,<1", "Markdown>=3.6,<4", "aiosqlite>=0.20",
 cli = ["simple-term-menu>=1.0,<2"]
 tts-premium = ["elevenlabs>=1.0,<2"]
 voice = [
-  # Local STT pulls in wheel-only transitive deps (ctranslate2, onnxruntime),
-  # so keep it out of the base install for source-build packagers like Homebrew.
+  # Local STT: uses ctranslate2 for inference, no onnxruntime required
   "faster-whisper>=1.0.0,<2",
   "sounddevice>=0.4.6,<1",
   "numpy>=1.24.0,<3",
