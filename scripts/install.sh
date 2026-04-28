@@ -30,7 +30,7 @@ REPO_URL_SSH="git@github.com:NousResearch/hermes-agent.git"
 REPO_URL_HTTPS="https://github.com/NousResearch/hermes-agent.git"
 HERMES_HOME="$HOME/.hermes"
 INSTALL_DIR="${HERMES_INSTALL_DIR:-$HERMES_HOME/hermes-agent}"
-PYTHON_VERSION="3.11"
+PYTHON_VERSION="3.14"
 NODE_VERSION="22"
 
 # Options

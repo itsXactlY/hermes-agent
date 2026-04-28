@@ -25,12 +25,12 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
-      - name: Set up Python 3.11
-        run: uv python install 3.11
+      - name: Set up Python 3.14
+        run: uv python install 3.14
 
       - name: Install dependencies
         run: |
-          uv venv .venv --python 3.11
+          uv venv .venv --python 3.14
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
@@ -54,12 +54,12 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
-      - name: Set up Python 3.11
-        run: uv python install 3.11
+      - name: Set up Python 3.14
+        run: uv python install 3.14
 
       - name: Install dependencies
         run: |
-          uv venv .venv --python 3.11
+          uv venv .venv --python 3.14
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
