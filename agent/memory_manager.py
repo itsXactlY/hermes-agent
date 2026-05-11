@@ -358,7 +358,7 @@ class MemoryManager:
     def update_session_id(self, session_id: str) -> None:
         """Propagate new session_id to all providers after session split (e.g. compression).
 
-        Neural Memory uses session_id as the archive tag. When compression creates
+        Mazemaker uses session_id as the archive tag. When compression creates
         a new session_id, providers must update their internal _session_id so that
         subsequent archive_compression() calls and prefetch queries use the new tag.
         """

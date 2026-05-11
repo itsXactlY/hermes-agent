@@ -1,4 +1,4 @@
-"""Tests for the Neural Memory provider plugin.
+"""Tests for the Mazemaker provider plugin.
 
 Tests cover config loading, tool handlers, prefetch, sync_turn,
 system prompt, schema completeness, and lifecycle hooks.
@@ -258,7 +258,7 @@ class TestSystemPrompt:
 
     def test_prompt_with_no_memories(self, provider):
         prompt = provider.system_prompt_block()
-        assert "Neural Memory" in prompt
+        assert "Mazemaker" in prompt
         assert "Empty" in prompt
 
     def test_prompt_with_memories(self, provider):
@@ -395,7 +395,7 @@ class TestLifecycle:
         provider._initial_context = provider._load_initial_context()
         result = provider.prefetch("test query")
         if provider._initial_context:
-            assert "initial" in result.lower() or "Neural Memory" in result
+            assert "initial" in result.lower() or "Mazemaker" in result
 
     def test_shutdown_clears_memory(self, provider):
         provider.shutdown()

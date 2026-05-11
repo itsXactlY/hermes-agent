@@ -290,7 +290,7 @@ class NeuralMemoryWidget(Static):
         if "error" in s:
             body.append(f"[ERR] {s['error'][:40]}", style=THEME.CRITICAL)
 
-        return _panel(body, title=f"[bold {THEME.PRIMARY}]⟨ Neural Memory ⟩[/]")
+        return _panel(body, title=f"[bold {THEME.PRIMARY}]⟨ Mazemaker ⟩[/]")
 
 
 class ProcessList(Static):

@@ -1,6 +1,10 @@
-"""CLI commands for Neural Memory provider.
+"""CLI commands for the Mazemaker memory provider.
 
-Handles: hermes neural status | remember | recall | think | graph
+Handles: hermes mazemaker status | remember | recall | think | graph
+
+(Registered upstream under whichever subcommand main.py wires in;
+this module is provider-agnostic about its own name and uses the
+string "mazemaker" everywhere the user is exposed to it.)
 """
 
 from __future__ import annotations
@@ -13,15 +17,18 @@ from plugins.memory import load_memory_provider
 from hermes_constants import get_hermes_home
 
 
+PROVIDER_NAME = "mazemaker"
+
+
 def _load_provider():
-    """Load and return the neural memory provider, or None."""
+    """Load and return the Mazemaker memory provider, or None."""
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
         mem_cfg = cfg.get("memory", {})
-        if mem_cfg.get("provider") != "neural":
+        if mem_cfg.get("provider") != PROVIDER_NAME:
             return None
-        return load_memory_provider("neural")
+        return load_memory_provider(PROVIDER_NAME)
     except Exception:
         return None
 
@@ -30,9 +37,9 @@ def _ensure_provider():
     """Load provider, exit with error if not available."""
     prov = _load_provider()
     if prov is None:
-        print("Neural memory provider is not active.")
-        print("  Set memory.provider=neural in ~/.hermes/config.yaml to enable.")
-        print("  Or: hermes config set memory.provider neural")
+        print(f"Mazemaker memory provider is not active.")
+        print(f"  Set memory.provider={PROVIDER_NAME} in ~/.hermes/config.yaml to enable.")
+        print(f"  Or: hermes config set memory.provider {PROVIDER_NAME}")
         sys.exit(1)
     return prov
 
@@ -42,23 +49,23 @@ def _ensure_provider():
 # ────────────────────────────────────────────────────────────────────────────
 
 def cmd_status(args) -> None:
-    """Show neural memory status."""
+    """Show Mazemaker memory status."""
     prov = _load_provider()
 
     if prov is None:
-        print("Neural memory provider is not active (memory.provider != 'neural')")
+        print(f"Mazemaker memory provider is not active (memory.provider != '{PROVIDER_NAME}')")
         print("\nTo enable:")
-        print("  hermes config set memory.provider neural")
+        print(f"  hermes config set memory.provider {PROVIDER_NAME}")
         return
 
-    prov.initialize(session_id="neural-cli-status", platform="cli",
+    prov.initialize(session_id="mazemaker-cli-status", platform="cli",
                      hermes_home=str(Path("~/.hermes").expanduser()),
                      agent_context="cli")
 
     db_path = "?"
     size_mb = "?"
     try:
-        db_path = Path(prov._config.get("db_path", "~/.neural_memory/memory.db"))
+        db_path = Path(prov._config.get("db_path", "~/.mazemaker/memory.db"))
         db_path = db_path.expanduser()
         exists = db_path.exists()
         size = db_path.stat().st_size if exists else 0
@@ -103,7 +110,7 @@ def cmd_status(args) -> None:
 def _cli_init(prov):
     """Initialize a provider for CLI use."""
     prov.initialize(
-        session_id="neural-cli",
+        session_id="mazemaker-cli",
         platform="cli",
         hermes_home=str(Path("~/.hermes").expanduser()),
         agent_context="cli",
@@ -117,12 +124,12 @@ def cmd_remember(args) -> None:
 
     content = " ".join(args.content) if isinstance(args.content, list) else args.content
     if not content:
-        print("Usage: hermes neural remember <content>")
-        print("  Stores a memory in the neural memory system.")
+        print("Usage: hermes mazemaker remember <content>")
+        print("  Stores a memory in the Mazemaker memory graph.")
         print()
         print("Examples:")
-        print("  hermes neural remember User prefers dark mode")
-        print("  hermes neural remember --label=user_prefs 'Dark mode preferred'")
+        print("  hermes mazemaker remember User prefers dark mode")
+        print("  hermes mazemaker remember --label=user_prefs 'Dark mode preferred'")
         sys.exit(1)
 
     try:
@@ -147,12 +154,12 @@ def cmd_recall(args) -> None:
 
     query = " ".join(args.query) if isinstance(args.query, list) else args.query
     if not query:
-        print("Usage: hermes neural recall <query>")
-        print("  Search neural memory semantically.")
+        print("Usage: hermes mazemaker recall <query>")
+        print("  Search Mazemaker memory semantically.")
         print()
         print("Examples:")
-        print("  hermes neural recall python environment")
-        print("  hermes neural recall --limit=10 'hermes setup'")
+        print("  hermes mazemaker recall python environment")
+        print("  hermes mazemaker recall --limit=10 'hermes setup'")
         sys.exit(1)
 
     try:
@@ -190,13 +197,13 @@ def cmd_think(args) -> None:
     memory_id = args.memory_id
 
     if memory_id is None and not args.query:
-        print("Usage: hermes neural think <memory_id|query>")
+        print("Usage: hermes mazemaker think <memory_id|query>")
         print("  Explore connected memories via spreading activation.")
         print()
         print("Examples:")
-        print("  hermes neural think 1234")
-        print("  hermes neural think --query='hermes setup'")
-        print("  hermes neural think --memory-id=5678 --depth=3")
+        print("  hermes mazemaker think 1234")
+        print("  hermes mazemaker think --query='hermes setup'")
+        print("  hermes mazemaker think --memory-id=5678 --depth=3")
         sys.exit(1)
 
     try:
@@ -245,7 +252,7 @@ def cmd_graph(args) -> None:
     prov = _load_provider()
 
     if prov is None:
-        print("Neural memory provider is not active.")
+        print("Mazemaker memory provider is not active.")
         sys.exit(1)
 
     prov = _load_provider()
@@ -266,7 +273,6 @@ def cmd_graph(args) -> None:
         total_conn = stats.get("connections", stats.get("total_connections", "?"))
         embed_dim = stats.get("embedding_dim", "?")
         backend = stats.get("embedding_backend", "?")
-        mssql = stats.get("mssql_mirror", False)
 
         # DB size from graph nodes count (approximate)
         try:
@@ -275,10 +281,9 @@ def cmd_graph(args) -> None:
         except Exception:
             db_size = "?"
 
-        print(f"  Memories:     {total_mem}")
-        print(f"  Connections:  {total_conn}")
-        print(f"  Embedding:    {embed_dim}d ({backend})")
-        print(f"  MSSQL mirror: {mssql}")
+        print(f"  Memories:    {total_mem}")
+        print(f"  Connections: {total_conn}")
+        print(f"  Embedding:   {embed_dim}d ({backend})")
         print()
 
         # Top connections (edges: {from, to, weight})
@@ -312,30 +317,29 @@ def cmd_graph(args) -> None:
 # ────────────────────────────────────────────────────────────────────────────
 
 def register_cli(subparser) -> None:
-    """Register neural memory CLI commands (hermes neural ...).
+    """Register Mazemaker memory CLI commands.
 
-    subparser is ALREADY the 'neural' ArgumentParser created by main.py.
-    Do NOT call subparser.add_parser("neural", ...). Just add sub-subcommands.
+    `subparser` is ALREADY the ArgumentParser created by Hermes main.py
+    for whichever subcommand the operator typed (historically 'neural';
+    upstream may migrate this to 'mazemaker'). Do NOT call
+    subparser.add_parser(<name>, ...). Just add sub-subcommands.
     """
-    neural_sub = subparser.add_subparsers(dest="neural_cmd", metavar="CMD")
+    mz_sub = subparser.add_subparsers(dest="mazemaker_cmd", metavar="CMD")
 
-    # hermes neural status
-    status_parser = neural_sub.add_parser(
-        "status", help="Show neural memory status and stats."
+    status_parser = mz_sub.add_parser(
+        "status", help="Show Mazemaker memory status and stats."
     )
     status_parser.set_defaults(func=cmd_status)
 
-    # hermes neural remember
-    remember_parser = neural_sub.add_parser(
-        "remember", help="Store a memory in neural memory."
+    remember_parser = mz_sub.add_parser(
+        "remember", help="Store a memory in Mazemaker."
     )
     remember_parser.add_argument("content", nargs="+", help="Memory content")
     remember_parser.add_argument("--label", "-l", dest="label",
                                  help="Optional label for this memory")
     remember_parser.set_defaults(func=cmd_remember)
 
-    # hermes neural recall
-    recall_parser = neural_sub.add_parser(
+    recall_parser = mz_sub.add_parser(
         "recall", help="Search memories semantically."
     )
     recall_parser.add_argument("query", nargs="+", help="Search query")
@@ -343,8 +347,7 @@ def register_cli(subparser) -> None:
                                help="Max results (default: 5)")
     recall_parser.set_defaults(func=cmd_recall)
 
-    # hermes neural think
-    think_parser = neural_sub.add_parser(
+    think_parser = mz_sub.add_parser(
         "think", help="Explore connected memories via spreading activation."
     )
     think_parser.add_argument("memory_id", nargs="?", type=int, default=None,
@@ -355,8 +358,7 @@ def register_cli(subparser) -> None:
                              help="Activation depth (default: 3)")
     think_parser.set_defaults(func=cmd_think)
 
-    # hermes neural graph
-    graph_parser = neural_sub.add_parser(
+    graph_parser = mz_sub.add_parser(
         "graph", help="Show knowledge graph statistics."
     )
     graph_parser.set_defaults(func=cmd_graph)

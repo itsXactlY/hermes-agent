@@ -1,1 +1,0 @@
-/home/alca/projects/neural-memory-adapter/python/lstm_knn_bridge.py
