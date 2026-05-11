@@ -13,7 +13,7 @@ import psutil
 _HERMES_DIR = Path.home() / ".hermes"
 _GATEWAY_STATE = _HERMES_DIR / "gateway_state.json"
 _LOG_PATH = _HERMES_DIR / "logs" / "agent.log"
-_NEURAL_DB = Path.home() / ".neural_memory" / "memory.db"
+_NEURAL_DB = Path.home() / ".mazemaker" / "memory.db"
 
 _LOG_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)\s+"
@@ -91,8 +91,7 @@ def get_hermes_processes() -> list[dict]:
             is_hermes = (
                 "hermes" in cmdline.lower()
                 or "mcp_local" in cmdline
-                or "neural_memory" in cmdline
-                or "neural-memory" in cmdline
+                or "mazemaker" in cmdline
                 or info["pid"] == gateway_pid
             )
             if not is_hermes:
