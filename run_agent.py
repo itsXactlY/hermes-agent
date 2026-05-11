@@ -2129,6 +2129,16 @@ class AIAgent:
         else:
             prompt = self._SKILL_REVIEW_PROMPT
 
+        # Drop the new review if a prior one is still in flight.  Each review
+        # forks an AIAgent — model, tools, httpx client, subprocesses — and
+        # holds a copy of messages_snapshot.  At wonderland's proxied latency
+        # an unbounded spawn rate piled up 30+ concurrent reviews per session
+        # (rss ~50 MB each), which dominated the resident-set growth.
+        prior_review = getattr(self, "_bg_review_thread", None)
+        if prior_review is not None and prior_review.is_alive():
+            logger.debug("bg-review skipped: prior review still in flight")
+            return
+
         def _run_review():
             import contextlib, os as _os
             review_agent = None
@@ -2205,6 +2215,7 @@ class AIAgent:
                         pass
 
         t = threading.Thread(target=_run_review, daemon=True, name="bg-review")
+        self._bg_review_thread = t
         t.start()
 
     def _apply_persist_user_message_override(self, messages: List[Dict]) -> None:
@@ -6672,7 +6683,7 @@ class AIAgent:
                 logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
 
         # CRITICAL: propagate new session_id to ALL external memory providers.
-        # Neural Memory uses session_id as the archive_tag — without this update,
+        # Mazemaker uses session_id as the archive_tag — without this update,
         # prefetch_after_compress searches the OLD session tag while new archives
         # go to the NEW session tag, so no recalled context is found.
         if self._memory_manager:
